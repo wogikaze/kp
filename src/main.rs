@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml_edit::DocumentMut;
@@ -201,7 +202,7 @@ fn cmd_new(contest_id: &str, open_flag: bool) -> Result<()> {
     let root = PathBuf::from(contest_id);
     let cargo_toml = root.join("Cargo.toml");
     if cargo_toml.exists() {
-        append_bins(&cargo_toml)?;
+        append_bins(&cargo_toml, &root, contest_id)?;
     }
     if open_flag {
         let url = format!("https://atcoder.jp/contests/{}", contest_id);
@@ -446,13 +447,81 @@ fn save_config(acc_conf: &Path, cfg: &KpConfig) -> Result<()> {
     Ok(())
 }
 
-fn append_bins(cargo_toml: &Path) -> Result<()> {
+fn append_bins(cargo_toml: &Path, contest_dir: &Path, contest_id: &str) -> Result<()> {
+    // Read Cargo.toml text
     let mut text = fs::read_to_string(cargo_toml)?;
-    if text.contains("[[bin]]") {
-        return Ok(()); // 既に追加済み
+    let had_bins = text.contains("[[bin]]");
+
+    // Set or insert package.name using simple string manipulation
+    if let Some(pkg_start) = text.find("[package]") {
+        // find end of package table (next table header like '\n[') or EOF
+        let rest = &text[pkg_start..];
+        let next_table = rest.find("\n[").map(|n| pkg_start + n);
+        let pkg_end = next_table.unwrap_or(text.len());
+        let pkg_section = &text[pkg_start..pkg_end];
+
+        // Rebuild package section with name replaced/inserted
+        let mut new_pkg = String::new();
+        let mut name_replaced = false;
+        for (i, line) in pkg_section.lines().enumerate() {
+            if i == 0 {
+                new_pkg.push_str(line);
+                new_pkg.push('\n');
+                continue;
+            }
+            if !name_replaced && line.trim_start().starts_with("name") {
+                new_pkg.push_str(&format!("name = \"{}\"\n", contest_id));
+                name_replaced = true;
+            } else {
+                new_pkg.push_str(line);
+                new_pkg.push('\n');
+            }
+        }
+        if !name_replaced {
+            // insert name after the [package] header
+            let after_header = new_pkg.find('\n').map(|n| n + 1).unwrap_or(new_pkg.len());
+            new_pkg.insert_str(after_header, &format!("name = \"{}\"\n", contest_id));
+        }
+        text = format!("{}{}{}", &text[..pkg_start], new_pkg, &text[pkg_end..]);
+    } else {
+        // no package table: prepend one
+        text = format!("[package]\nname = \"{}\"\n\n{}", contest_id, text);
     }
-    text.push_str("\n[[bin]]\nname = \"a\"\npath = \"a/src/main.rs\"\n");
-    fs::write(cargo_toml, text)?;
+    fs::write(cargo_toml, &text)?;
+
+    // If binary entries already exist, do not add more
+    if had_bins {
+        return Ok(());
+    }
+
+    // Read contest.acc.json to get tasks
+    let contest_json = contest_dir.join("contest.acc.json");
+    if !contest_json.exists() {
+        return Ok(());
+    }
+    let cj_text = fs::read_to_string(&contest_json)?;
+    let cf: ContestFile =
+        serde_json::from_str(&cj_text).context("failed to parse contest.acc.json")?;
+
+    // Build [[bin]] entries
+    let mut bins_text = String::new();
+    for task in cf.tasks.iter() {
+        // Determine bin name: prefer short suffix (after contest_id + '_'), else label (lowercase), else full id
+        let name = if let Some(s) = task.id.strip_prefix(&format!("{}_", contest_id)) {
+            s.to_string()
+        } else if let Some(lbl) = &task.label {
+            lbl.to_lowercase()
+        } else {
+            task.id.clone()
+        };
+        let path = format!("src/{}.rs", name);
+        bins_text.push_str("\n[[bin]]\n");
+        bins_text.push_str(&format!("name = \"{}\"\n", name));
+        bins_text.push_str(&format!("path = \"{}\"\n", path));
+    }
+
+    let mut f = fs::OpenOptions::new().append(true).open(cargo_toml)?;
+    f.write_all(bins_text.as_bytes())?;
     Ok(())
 }
 
