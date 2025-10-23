@@ -37,8 +37,9 @@ enum Commands {
     },
     /// テスト実行
     Test {
-        contest_id: Option<String>,
-        problem_id: String,
+        /// contest id (optional). If omitted, current dir is used.
+        #[arg(num_args = 1..=2)]
+        params: Vec<String>,
     },
     /// 提出
     Submit {
@@ -46,7 +47,13 @@ enum Commands {
         problem_id: String,
     },
     /// 問題ページを開く
-    Open { problem_id: String },
+    /// Usage: kp open [contest_id] [problem_id]
+    Open {
+        /// contest id (e.g. abc411). If omitted, look for contest.acc.json in current dir
+        contest_id: Option<String>,
+        /// problem id (e.g. a or abc411_a). If omitted, open contest URL from contest.acc.json
+        problem_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,15 +92,19 @@ fn main() -> Result<()> {
             ConfigSub::Set { key, value } => cmd_config_set(&key, &value)?,
         },
         Commands::New { contest_id, open } => cmd_new(&contest_id, open)?,
-        Commands::Test {
-            contest_id,
-            problem_id,
-        } => cmd_test(contest_id.as_deref(), &problem_id)?,
+        Commands::Test { params } => match params.as_slice() {
+            [pid] => cmd_test(None, pid)?,
+            [cid, pid] => cmd_test(Some(cid), pid)?,
+            _ => anyhow::bail!("Usage: kp test [contest_id] <problem_id>"),
+        },
         Commands::Submit {
             contest_id,
             problem_id,
         } => cmd_submit(contest_id.as_deref(), &problem_id)?,
-        Commands::Open { problem_id } => cmd_open(&problem_id)?,
+        Commands::Open {
+            contest_id,
+            problem_id,
+        } => cmd_open(contest_id.as_deref(), problem_id.as_deref())?,
     }
     Ok(())
 }
@@ -203,9 +214,29 @@ fn cmd_test(contest_id: Option<&str>, problem_id: &str) -> Result<()> {
     let dir = contest_id
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    let test_dir = format!("{problem_id}/tests");
+    let test_dir = format!("tests/{problem_id}");
     let cmd = format!("cargo run --bin {problem_id}");
-    run_in("oj", &["test", "-c", &cmd, "-d", &test_dir], &dir)?;
+    // On Windows, ask oj to run `cmd /C <command>` so it executes via cmd
+    let args_owned: Vec<String> = if cfg!(target_os = "windows") {
+        let wrapped = format!("cmd /C {}", cmd);
+        vec![
+            "test".to_string(),
+            "-c".to_string(),
+            wrapped,
+            "-d".to_string(),
+            test_dir.clone(),
+        ]
+    } else {
+        vec![
+            "test".to_string(),
+            "-c".to_string(),
+            cmd.clone(),
+            "-d".to_string(),
+            test_dir.clone(),
+        ]
+    };
+    let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
+    run_in("oj", &args, &dir)?;
     Ok(())
 }
 
@@ -213,25 +244,118 @@ fn cmd_submit(contest_id: Option<&str>, problem_id: &str) -> Result<()> {
     let dir = contest_id
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    let test_dir = format!("{problem_id}/tests");
+    let test_dir = format!("tests/{problem_id}");
     let cmd = format!("cargo run --bin {problem_id}");
     let cfg = load_config(&acc_config_dir()?)?;
     if cfg.minify_on_submit {
         println!("⚠️ minify_on_submit=true, but minify is not implemented yet");
     }
-    run_in("oj", &["submit", "-c", &cmd, "-d", &test_dir], &dir)?;
+    let args_owned: Vec<String> = if cfg!(target_os = "windows") {
+        let wrapped = format!("cmd /C {}", cmd);
+        vec![
+            "submit".to_string(),
+            "-c".to_string(),
+            wrapped,
+            "-d".to_string(),
+            test_dir.clone(),
+        ]
+    } else {
+        vec![
+            "submit".to_string(),
+            "-c".to_string(),
+            cmd.clone(),
+            "-d".to_string(),
+            test_dir.clone(),
+        ]
+    };
+    let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
+    run_in("oj", &args, &dir)?;
     Ok(())
 }
 
-fn cmd_open(problem_id: &str) -> Result<()> {
+// JSON structures for contest.acc.json (partial)
+#[derive(Deserialize, Debug)]
+struct ContestFile {
+    contest: ContestEntry,
+    tasks: Vec<TaskEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ContestEntry {
+    id: String,
+    title: Option<String>,
+    url: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct TaskEntry {
+    id: String,
+    label: Option<String>,
+    title: Option<String>,
+    url: String,
+    directory: Option<serde_json::Value>,
+}
+
+/// Open logic per user's spec:
+/// - kp open (contest_id) (problem_id)
+/// - If contest_id omitted: look for contest.acc.json in cwd, error if missing
+/// - If problem_id omitted: open contest.url from contest.acc.json
+/// - If contest_id present but problem_id omitted: look for contest_id/contest.acc.json and open contest.url
+/// - If both present: open the specific task url found in the contest's contest.acc.json
+fn cmd_open(contest_id: Option<&str>, problem_id: Option<&str>) -> Result<()> {
+    // Helper to read contest.acc.json from a directory
+    let read_contest_file = |dir: &Path| -> Result<ContestFile> {
+        let p = dir.join("contest.acc.json");
+        if !p.exists() {
+            anyhow::bail!("contest.acc.json not found in {}", dir.display());
+        }
+        let txt = fs::read_to_string(&p)?;
+        let cf: ContestFile =
+            serde_json::from_str(&txt).context("failed to parse contest.acc.json")?;
+        Ok(cf)
+    };
+
     let cwd = std::env::current_dir()?;
-    let contest_id = cwd
-        .file_name()
-        .and_then(|s| s.to_str())
-        .context("contest_id not found (current dir)")?;
-    let url = format!("https://atcoder.jp/contests/{contest_id}/tasks/{problem_id}");
-    open_in_browser(&url)?;
-    Ok(())
+
+    match (contest_id, problem_id) {
+        (None, None) => anyhow::bail!("Either contest_id or problem_id must be provided (or contest.acc.json must exist in current dir)"),
+        (None, Some(_)) => {
+            // Use contest.acc.json in cwd
+            let cf = read_contest_file(&cwd)?;
+            // find task by problem_id: accept suffix match (e.g., 'a' -> abc411_a) or full id
+            let pid = problem_id.unwrap();
+            let task = cf.tasks.iter().find(|t| t.id == pid || t.id.ends_with(&format!("_{}", pid)));
+            if let Some(t) = task {
+                open_in_browser(&t.url)?;
+                return Ok(());
+            }
+            anyhow::bail!("Problem '{}' not found in contest.acc.json in {}", pid, cwd.display());
+        }
+        (Some(cid), None) => {
+            // Look for <cid>/contest.acc.json
+            let dir = cwd.join(cid);
+            if !dir.exists() || !dir.is_dir() {
+                anyhow::bail!("Contest directory '{}' not found", cid);
+            }
+            let cf = read_contest_file(&dir)?;
+            open_in_browser(&cf.contest.url)?;
+            return Ok(());
+        }
+        (Some(cid), Some(pid)) => {
+            // Look for contest file in cid dir
+            let dir = cwd.join(cid);
+            if !dir.exists() || !dir.is_dir() {
+                anyhow::bail!("Contest directory '{}' not found", cid);
+            }
+            let cf = read_contest_file(&dir)?;
+            let task = cf.tasks.iter().find(|t| t.id == pid || t.id.ends_with(&format!("_{}", pid)));
+            if let Some(t) = task {
+                open_in_browser(&t.url)?;
+                return Ok(());
+            }
+            anyhow::bail!("Problem '{}' not found in contest '{}'", pid, cid);
+        }
+    }
 }
 
 /// ==============================
