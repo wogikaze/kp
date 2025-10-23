@@ -1,312 +1,349 @@
-// kp: AtCoder project management CLI
-// ------------------------------------------------------------
-// * kp new <contest_id>      : generate contest workspace
-// * kp test <contest_id> <problem> : build & `oj test` a single task
-// ------------------------------------------------------------
-
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
-use serde_json::{json, Value};
-use std::{
-    fs::{self, File},
-    io::{BufReader, Write},
-    path::{Path, PathBuf},
-    process::{exit, Command},
-};
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use toml_edit::DocumentMut;
 
-#[derive(Parser)]
-#[command(author, version, about)]
+/// ==============================
+/// 定義
+/// ==============================
+
+const DEFAULT_TEMPLATE_URL: &str = "https://github.com/wogikaze/kp-rust";
+const CONFIG_FILE_NAME: &str = "kp-config.toml";
+
+#[derive(Parser, Debug)]
+#[command(name = "kp", version, about = "AtCoder Rust CLI")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    command: Commands,
 }
 
-#[derive(Subcommand)]
-enum Cmd {
-    /// Init the kp-rust template
-    Init {},
-    /// Create a new contest workspace
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// 初期設定
+    Init,
+    /// 設定を一覧または変更
+    Config {
+        #[command(subcommand)]
+        sub: ConfigSub,
+    },
+    /// 新しいコンテストプロジェクトを作成
     New {
-        /// Contest ID (e.g. abc300)
-        contest: String,
+        contest_id: String,
+        #[arg(long)]
+        open: bool,
     },
-    /// Build & `oj test` a problem
+    /// テスト実行
     Test {
-        /// Contest ID (e.g. abc300)
-        contest: String,
-        /// Problem ID letter (e.g. a)
-        problem: String,
+        contest_id: Option<String>,
+        problem_id: String,
     },
-}
-#[derive(Deserialize)]
-struct Input {
-    tasks: Vec<Task>,
-}
-
-#[derive(Deserialize)]
-struct Task {
-    /// e.g. "A", "B", …
-    label: String,
-    directory: Directory,
+    /// 提出
+    Submit {
+        contest_id: Option<String>,
+        problem_id: String,
+    },
+    /// 問題ページを開く
+    Open { problem_id: String },
 }
 
-#[derive(Deserialize)]
-struct Directory {
-    /// e.g. "a.rs"
-    submit: String,
-}
-fn main() {
-    if let Err(err) = run() {
-        eprintln!("Error: {err}");
-        exit(1);
-    }
+#[derive(Subcommand, Debug)]
+enum ConfigSub {
+    /// 現在の設定を表示
+    List,
+    /// 設定を変更
+    Set { key: String, value: String },
 }
 
-fn run() -> Result<()> {
-    match Cli::parse().cmd {
-        Cmd::Init {} => init_template(),
-        Cmd::New { contest } => create_contest(&contest),
-        Cmd::Test { contest, problem } => test_problem(&contest, &problem),
-    }
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct KpConfig {
+    template_repository_url: String,
+    minify_on_submit: bool,
 }
 
-//
-// -------- sub-command implementations
-//
-fn command(command_str: &str) -> Command {
-    if cfg!(target_os = "windows") {
-        let mut cmd = Command::new("powershell");
-        cmd.arg("-Command").arg(command_str);
-        cmd
-    } else {
-        Command::new(command_str)
-    }
-}
-/// `kp init`
-fn init_template() -> Result<()> {
-    // 1. Obtain the path printed by `acc config-dir`
-    let output = command("acc")
-        .arg("config-dir")
-        .output()
-        .context("failed to start `acc config-dir`")?;
-
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "`acc config-dir` exited with status {}",
-            output.status
-        ));
-    }
-    let config_dir = String::from_utf8(output.stdout)
-        .context("`acc config-dir` produced non-UTF-8 output")?
-        .trim()
-        .replace("\r\n", "")
-        .replace('\n', "");
-    // Remove trailing new-line(s) and convert to PathBuf
-    let config_dir = PathBuf::from(config_dir.trim());
-
-    // 2. Decide whether `kp-rust` exists
-    let kp_path = config_dir.join("kp-rust");
-
-    if kp_path.exists() {
-        // 3-a. Pull the latest changes
-        let status = command("git")
-            .arg("pull")
-            .current_dir(&kp_path)
-            .status()
-            .context("failed to run `git pull`")?;
-
-        if !status.success() {
-            return Err(anyhow::anyhow!("`git pull` failed with status {}", status));
-        }
-    } else {
-        // 3-b. Clone the repository
-        let status = command("git")
-            .arg("clone")
-            .arg("https://github.com/wogikaze/kp-rust")
-            .current_dir(&config_dir)
-            .status()
-            .context("failed to run `git clone`")?;
-
-        if !status.success() {
-            return Err(anyhow::anyhow!("`git clone` failed with status {}", status));
+impl Default for KpConfig {
+    fn default() -> Self {
+        Self {
+            template_repository_url: DEFAULT_TEMPLATE_URL.to_string(),
+            minify_on_submit: false,
         }
     }
+}
 
-    // 4. Set Config the template
-    let default_template = command("acc")
-        .arg("config")
-        .arg("default-template")
-        .output()
-        .context("failed to run `acc config default-template`")?;
+/// ==============================
+/// メイン処理
+/// ==============================
 
-    let status = default_template.status;
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Init => cmd_init()?,
+        Commands::Config { sub } => match sub {
+            ConfigSub::List => cmd_config_list()?,
+            ConfigSub::Set { key, value } => cmd_config_set(&key, &value)?,
+        },
+        Commands::New { contest_id, open } => cmd_new(&contest_id, open)?,
+        Commands::Test {
+            contest_id,
+            problem_id,
+        } => cmd_test(contest_id.as_deref(), &problem_id)?,
+        Commands::Submit {
+            contest_id,
+            problem_id,
+        } => cmd_submit(contest_id.as_deref(), &problem_id)?,
+        Commands::Open { problem_id } => cmd_open(&problem_id)?,
+    }
+    Ok(())
+}
+
+/// ==============================
+/// サブコマンド
+/// ==============================
+
+fn cmd_init() -> Result<()> {
+    ensure_tools(&["acc", "oj", "git", "cargo"])?;
+    let acc_conf = acc_config_dir()?;
+
+    let cfg_path = acc_conf.join(CONFIG_FILE_NAME);
+    if !cfg_path.exists() {
+        save_config(&acc_conf, &KpConfig::default())?;
+    }
+
+    let cfg = load_config(&acc_conf)?;
+
+    let tpl_dir = acc_conf.join("kp-rust");
+    if tpl_dir.exists() {
+        run_in("git", &["pull"], &tpl_dir)?;
+    } else {
+        run_in(
+            "git",
+            &["clone", &cfg.template_repository_url, "kp-rust"],
+            &acc_conf,
+        )?;
+    }
+
+    // acc 設定
+    run("acc", &["config", "default-template", "kp-rust"])?;
+    run("acc", &["config", "default-task-dirname-format", "./"])?;
+    run("acc", &["config", "default-task-choice", "all"])?;
+    println!("✅ Initialized successfully");
+    Ok(())
+}
+
+fn cmd_config_list() -> Result<()> {
+    let cfg = load_config(&acc_config_dir()?)?;
+    println!("{}", serde_json::to_string_pretty(&cfg)?);
+    Ok(())
+}
+
+fn cmd_config_set(key: &str, new_value: &str) -> Result<()> {
+    use toml_edit::value as toml_val;
+
+    let acc_conf = acc_config_dir()?;
+    let path = acc_conf.join(CONFIG_FILE_NAME);
+
+    // 既存の設定を読み込み（なければ空の Document）
+    let original_text = fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: DocumentMut = original_text.parse().unwrap_or_else(|_| DocumentMut::new());
+
+    // 旧値を控えておき、必要なら init を最小限で再実行
+    let old_template = doc
+        .get("template_repository_url")
+        .and_then(|it| it.as_str())
+        .map(|s| s.to_string());
+
+    match key {
+        "template_repository_url" => {
+            doc["template_repository_url"] = toml_val(new_value.to_string());
+        }
+        "minify_on_submit" => {
+            let parsed = new_value
+                .parse::<bool>()
+                .context("minify_on_submit must be true/false")?;
+            doc["minify_on_submit"] = toml_val(parsed);
+        }
+        _ => anyhow::bail!("Unknown key: {}", key),
+    }
+
+    // 保存
+    fs::create_dir_all(&acc_conf)?;
+    fs::write(&path, doc.to_string())?;
+    println!("🔧 Updated config: {} = {}", key, new_value);
+
+    // テンプレURLが変わったときだけ init 相当を実行
+    let changed_template = match (old_template.as_deref(), key) {
+        (Some(old), "template_repository_url") => old != new_value,
+        (None, "template_repository_url") => true,
+        _ => false,
+    };
+    if changed_template {
+        cmd_init()?; // テンプレ取得や acc 既定設定を反映
+    }
+
+    Ok(())
+}
+
+fn cmd_new(contest_id: &str, open_flag: bool) -> Result<()> {
+    run("acc", &["new", contest_id])?;
+    let root = PathBuf::from(contest_id);
+    let cargo_toml = root.join("Cargo.toml");
+    if cargo_toml.exists() {
+        append_bins(&cargo_toml)?;
+    }
+    if open_flag {
+        let url = format!("https://atcoder.jp/contests/{}", contest_id);
+        open_in_browser(&url)?;
+    }
+    Ok(())
+}
+
+fn cmd_test(contest_id: Option<&str>, problem_id: &str) -> Result<()> {
+    let dir = contest_id
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    let test_dir = format!("{problem_id}/tests");
+    let cmd = format!("cargo run --bin {problem_id}");
+    run_in("oj", &["test", "-c", &cmd, "-d", &test_dir], &dir)?;
+    Ok(())
+}
+
+fn cmd_submit(contest_id: Option<&str>, problem_id: &str) -> Result<()> {
+    let dir = contest_id
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    let test_dir = format!("{problem_id}/tests");
+    let cmd = format!("cargo run --bin {problem_id}");
+    let cfg = load_config(&acc_config_dir()?)?;
+    if cfg.minify_on_submit {
+        println!("⚠️ minify_on_submit=true, but minify is not implemented yet");
+    }
+    run_in("oj", &["submit", "-c", &cmd, "-d", &test_dir], &dir)?;
+    Ok(())
+}
+
+fn cmd_open(problem_id: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let contest_id = cwd
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("contest_id not found (current dir)")?;
+    let url = format!("https://atcoder.jp/contests/{contest_id}/tasks/{problem_id}");
+    open_in_browser(&url)?;
+    Ok(())
+}
+
+/// ==============================
+/// ユーティリティ
+/// ==============================
+
+fn ensure_tools(tools: &[&str]) -> Result<()> {
+    for tool in tools {
+        let checker = if cfg!(target_os = "windows") {
+            "where"
+        } else {
+            "which"
+        };
+        let status = Command::new(checker)
+            .arg(tool)
+            .status()
+            .with_context(|| format!("failed to run `{}` to check for {}", checker, tool))?;
+        if !status.success() {
+            // Provide PATH context to help debugging
+            let path = std::env::var("PATH").unwrap_or_default();
+            anyhow::bail!("Required tool '{}' not found in PATH. Please install it and ensure it's on your PATH. PATH={}", tool, path);
+        }
+    }
+    Ok(())
+}
+
+// Run a command in a platform-appropriate way. On Windows, use `cmd /C` so
+// shims like npm's `.cmd`/.ps1 are resolved the same way an interactive shell
+// would. On Unix, run directly.
+fn run(cmd: &str, args: &[&str]) -> Result<()> {
+    let status = if cfg!(target_os = "windows") {
+        let mut all = vec!["/C", cmd];
+        all.extend(args.iter().map(|s| *s));
+        Command::new("cmd").args(all).status()?
+    } else {
+        Command::new(cmd).args(args).status()?
+    };
     if !status.success() {
-        return Err(anyhow::anyhow!(
-            "`acc config default-template` failed with status {}",
-            status
-        ));
+        anyhow::bail!("Command failed: {} {:?}", cmd, args);
     }
-    let current_template = String::from_utf8(default_template.stdout)
-        .context("`acc config default-template` produced non-UTF-8 output")?;
-    if current_template.trim() != "kp-rust" {
-        // acc config default-template
-        let set_template = command("acc")
-            .args(["config", "default-template", "kp-rust"])
-            .status()
-            .context("failed to run `acc config default-template kp-rust`")?;
-        if !set_template.success() {
-            return Err(anyhow::anyhow!(
-                "`acc config default-template kp-rust` failed with status {}",
-                set_template
-            ));
-        }
-    }
-    command("acc")
-        .args(["config", "default-task-dirname-format", "./"])
-        .status()
-        .context("failed to run `acc config default-task-dirname-format ./`")?;
-
-    command("acc")
-        .args(["config", "default-task-choice", "all"])
-        .status()
-        .context("failed to run `acc config default-task-choice all`")?;
-
     Ok(())
 }
 
-/// `kp new`
-fn create_contest(contest: &str) -> Result<()> {
-    let root = Path::new(contest);
-    if root.exists() {
-        bail!("Directory {contest} already exists");
-    }
-    // Remove directories
-    // Create the contest directory
-    command("acc")
-        .args(["new", contest])
-        .status()
-        .context(format!("failed to run `acc new {}`", contest))?;
-
-    // -------- 0. get directory argument --------
-    let json_path = Path::new(contest).join("contest.acc.json");
-
-    // -------- 1. read JSON --------
-    let file =
-        fs::File::open(&json_path).with_context(|| format!("cannot open {:?}", json_path))?;
-    let input: Input = serde_json::from_reader(file)?;
-
-    // -------- 2. load Cargo.toml (project root) --------
-    let cargo_path = Path::new(contest).join("Cargo.toml");
-    let mut doc = fs::read_to_string(&cargo_path)?.parse::<DocumentMut>()?;
-
-    // ① Ensure [[bin]] is an ArrayOfTables, not a Value::Array
-    if doc.get("bin").is_none() {
-        doc["bin"] = Item::ArrayOfTables(ArrayOfTables::new());
-    }
-    let bins = doc["bin"]
-        .as_array_of_tables_mut() // ✅ correct accessor
-        .expect("`bin` must be an array-of-tables");
-
-    for task in input.tasks {
-        let name = task.label.to_lowercase();
-        let path = format!("{}", task.directory.submit);
-
-        // ② Each element is &Table, so we can inspect keys normally
-        if bins
-            .iter()
-            .any(|tbl: &Table| tbl.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
-        {
-            continue; // already present
-        }
-
-        // ③ Push a new table
-        let mut t = Table::new();
-        t["name"] = name.clone().into();
-        t["path"] = path.into();
-        t.set_implicit(true); // no '{}' braces
-        bins.push(t);
-    }
-
-    fs::write(&cargo_path, doc.to_string())?;
-
-    // .vscode/settings.jsonに追加
-
-    // Construct the path we want to add: "./<contest>/Cargo.toml".
-    let new_entry = format!("./{contest}/Cargo.toml");
-
-    // Path to VS Code settings.
-    let settings_path = Path::new(".vscode/settings.json");
-
-    // Ensure the .vscode directory exists.
-    if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Open the file for reading if it exists; otherwise start with an empty JSON object.
-    let mut root: Value = if settings_path.exists() {
-        let file = File::open(settings_path)
-            .with_context(|| format!("Failed to open {}", settings_path.display()))?;
-        serde_json::from_reader(BufReader::new(file))
-            .with_context(|| format!("{} is not valid JSON", settings_path.display()))?
+fn run_in(cmd: &str, args: &[&str], dir: &Path) -> Result<()> {
+    let status = if cfg!(target_os = "windows") {
+        let mut all = vec!["/C", cmd];
+        all.extend(args.iter().map(|s| *s));
+        Command::new("cmd").current_dir(dir).args(all).status()?
     } else {
-        json!({})
+        Command::new(cmd).current_dir(dir).args(args).status()?
     };
-
-    // Navigate to rust-analyzer.linkedProjects, creating intermediate objects as needed.
-    let linked_projects = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json must be a JSON object"))?
-        .entry("rust-analyzer.linkedProjects")
-        .or_insert_with(|| Value::Array(Vec::new()));
-
-    // Ensure the field is an array.
-    let arr = linked_projects
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("rust-analyzer.linkedProjects must be an array"))?;
-
-    // Append if not already present.
-    if !arr.iter().any(|v| v == &Value::String(new_entry.clone())) {
-        arr.push(Value::String(new_entry));
-    } else {
-        println!("Entry already present; nothing to do.");
-        return Ok(());
+    if !status.success() {
+        anyhow::bail!("Command failed in {:?}: {} {:?}", dir, cmd, args);
     }
-
-    // Write back atomically: serialize pretty-printed JSON then rename.
-    let tmp_path = settings_path.with_extension("json.tmp");
-    let mut tmp_file = File::create(&tmp_path)?;
-    tmp_file.write_all(serde_json::to_string_pretty(&root)?.as_bytes())?;
-    fs::rename(tmp_path, settings_path)?;
-
-    println!("Added new linked project successfully.");
-
     Ok(())
 }
 
-/// `kp test`
-fn test_problem(contest: &str, problem: &str) -> Result<()> {
-    let dir = Path::new(contest);
-    if !dir.exists() {
-        bail!("{} does not exist", dir.display());
-    }
-    // oj test -c "cargo run --bin a -d "testcases/a"
-    println!("🧪  oj test");
-    
-    let run_cmd = if cfg!(target_os = "windows") {
-        format!("\"cargo run --bin {problem}\"")
+fn acc_config_dir() -> Result<PathBuf> {
+    // Use same platform-aware invocation as run/run_in so Windows shims work.
+    let out = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", "acc", "config-dir"])
+            .output()
+            .context("failed to run acc config-dir")?
     } else {
-        format!("cargo run --bin {problem}")
+        Command::new("acc")
+            .arg("config-dir")
+            .output()
+            .context("failed to run acc config-dir")?
     };
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(PathBuf::from(s))
+}
 
-    command("oj")
-        .current_dir(Path::new(&dir))
-        .args(["test", "-c", &run_cmd])
-        .args(["-d", &format!("testcases/{problem}")])
-        .status()?
-        .success()
-        .then_some(());
+fn load_config(acc_conf: &Path) -> Result<KpConfig> {
+    let path = acc_conf.join(CONFIG_FILE_NAME);
+    if !path.exists() {
+        return Ok(KpConfig::default());
+    }
+    let text = fs::read_to_string(&path)?;
+    Ok(toml_edit::de::from_str(&text)?)
+}
 
+fn save_config(acc_conf: &Path, cfg: &KpConfig) -> Result<()> {
+    fs::create_dir_all(acc_conf)?;
+    let text = toml_edit::ser::to_string_pretty(cfg)?;
+    fs::write(acc_conf.join(CONFIG_FILE_NAME), text)?;
+    Ok(())
+}
+
+fn append_bins(cargo_toml: &Path) -> Result<()> {
+    let mut text = fs::read_to_string(cargo_toml)?;
+    if text.contains("[[bin]]") {
+        return Ok(()); // 既に追加済み
+    }
+    text.push_str("\n[[bin]]\nname = \"a\"\npath = \"a/src/main.rs\"\n");
+    fs::write(cargo_toml, text)?;
+    Ok(())
+}
+
+fn open_in_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd").args(["/C", "start", url]).spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(url).spawn()?;
+    }
     Ok(())
 }
