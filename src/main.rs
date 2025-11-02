@@ -204,6 +204,10 @@ fn cmd_new(contest_id: &str, open_flag: bool) -> Result<()> {
     if cargo_toml.exists() {
         append_bins(&cargo_toml, &root, contest_id)?;
     }
+    // Add the contest Cargo.toml to workspace VSCode linkedProjects for rust-analyzer
+    if let Err(e) = add_vscode_linked_project(contest_id) {
+        eprintln!("warning: failed to update .vscode/settings.json: {}", e);
+    }
     if open_flag {
         let url = format!("https://atcoder.jp/contests/{}", contest_id);
         open_in_browser(&url)?;
@@ -522,6 +526,73 @@ fn append_bins(cargo_toml: &Path, contest_dir: &Path, contest_id: &str) -> Resul
 
     let mut f = fs::OpenOptions::new().append(true).open(cargo_toml)?;
     f.write_all(bins_text.as_bytes())?;
+    Ok(())
+}
+
+fn add_vscode_linked_project(contest_id: &str) -> Result<()> {
+    use serde_json::{json, Value};
+
+    let cwd = std::env::current_dir()?;
+    let vscode_dir = cwd.join(".vscode");
+    let settings_path = vscode_dir.join("settings.json");
+
+    // Ensure .vscode exists
+    fs::create_dir_all(&vscode_dir)?;
+
+    let new_entry = format!("./{}/Cargo.toml", contest_id);
+
+    // Try to read existing settings.json
+    let mut value: Value = if settings_path.exists() {
+        let txt = fs::read_to_string(&settings_path)?;
+        match serde_json::from_str(&txt) {
+            Ok(v) => v,
+            Err(_) => {
+                // if parsing fails, start fresh
+                Value::Object(serde_json::Map::new())
+            }
+        }
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+
+    // Ensure it's an object
+    if !value.is_object() {
+        value = Value::Object(serde_json::Map::new());
+    }
+
+    // Get or create the linkedProjects array
+    let key = "rust-analyzer.linkedProjects";
+    let arr = match value.get_mut(key) {
+        Some(v) if v.is_array() => v.as_array_mut().unwrap(),
+        Some(v) if v.is_string() => {
+            // single string -> convert to array
+            let existing = v.as_str().unwrap().to_string();
+            *v = json!([existing]);
+            v.as_array_mut().unwrap()
+        }
+        Some(_) => {
+            // unexpected type, replace
+            value[key] = json!([new_entry]);
+            // Done, write file
+            let out = serde_json::to_string_pretty(&value)?;
+            fs::write(&settings_path, out)?;
+            return Ok(());
+        }
+        None => {
+            value[key] = json!([new_entry]);
+            let out = serde_json::to_string_pretty(&value)?;
+            fs::write(&settings_path, out)?;
+            return Ok(());
+        }
+    };
+
+    // Check presence
+    let exists = arr.iter().any(|v| v.as_str().map(|s| s == new_entry).unwrap_or(false));
+    if !exists {
+        arr.push(Value::String(new_entry));
+        let out = serde_json::to_string_pretty(&value)?;
+        fs::write(&settings_path, out)?;
+    }
     Ok(())
 }
 

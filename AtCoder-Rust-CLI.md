@@ -68,6 +68,7 @@ kpの設定に関するコマンド。
 ```sh
 acc new {contest_id}
 # Cargo.tomlの編集: [[bin]]セクションの追加, nameの設定
+# .vscode/settings.jsonの編集: rust-analyzerの設定追加
 ```
 
 ### test
