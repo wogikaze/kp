@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::collections::BTreeMap;
 use toml_edit::DocumentMut;
 
 /// ==============================
@@ -24,7 +25,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// 初期設定
-    Init,
+    Init {
+        /// template repository URL override (also updates config)
+        #[arg(long)]
+        repository: Option<String>,
+    },
     /// 設定を一覧または変更
     Config {
         #[command(subcommand)]
@@ -35,17 +40,26 @@ enum Commands {
         contest_id: String,
         #[arg(long)]
         open: bool,
+        /// language key (e.g. rust, cpp). If omitted, use default_language from config
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// テスト実行
     Test {
         /// contest id (optional). If omitted, current dir is used.
         #[arg(num_args = 1..=2)]
         params: Vec<String>,
+        /// language key (e.g. rust, cpp). If omitted, use default_language from config
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// 提出
     Submit {
         contest_id: Option<String>,
         problem_id: String,
+        /// language key (e.g. rust, cpp). If omitted, use default_language from config
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// 問題ページを開く
     /// Usage: kp open [contest_id] [problem_id]
@@ -67,14 +81,47 @@ enum ConfigSub {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct KpConfig {
+    /// legacy (kept for backward compatibility)
+    #[serde(default)]
     template_repository_url: String,
+    #[serde(default = "default_language")]
+    default_language: String,
+    #[serde(default)]
+    language: BTreeMap<String, LanguageConfig>,
     minify_on_submit: bool,
+}
+
+fn default_language() -> String {
+    "rust".to_string()
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct LanguageConfig {
+    /// repository URL for template
+    template_repository_url: Option<String>,
+    /// local template dir name (default: "kp-<lang>")
+    template_dir: Option<String>,
+    /// command template for test/submit (supports {problem_id} and {contest_id})
+    test_command: Option<String>,
+    submit_command: Option<String>,
 }
 
 impl Default for KpConfig {
     fn default() -> Self {
+        let mut language = BTreeMap::new();
+        language.insert(
+            "rust".to_string(),
+            LanguageConfig {
+                template_repository_url: Some(DEFAULT_TEMPLATE_URL.to_string()),
+                template_dir: Some("kp-rust".to_string()),
+                test_command: Some("cargo run --bin {problem_id}".to_string()),
+                submit_command: Some("cargo run --bin {problem_id}".to_string()),
+            },
+        );
         Self {
             template_repository_url: DEFAULT_TEMPLATE_URL.to_string(),
+            default_language: default_language(),
+            language,
             minify_on_submit: false,
         }
     }
@@ -87,21 +134,26 @@ impl Default for KpConfig {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init => cmd_init()?,
+        Commands::Init { repository } => cmd_init(repository.as_deref())?,
         Commands::Config { sub } => match sub {
             ConfigSub::List => cmd_config_list()?,
             ConfigSub::Set { key, value } => cmd_config_set(&key, &value)?,
         },
-        Commands::New { contest_id, open } => cmd_new(&contest_id, open)?,
-        Commands::Test { params } => match params.as_slice() {
-            [pid] => cmd_test(None, pid)?,
-            [cid, pid] => cmd_test(Some(cid), pid)?,
+        Commands::New {
+            contest_id,
+            open,
+            lang,
+        } => cmd_new(&contest_id, open, lang.as_deref())?,
+        Commands::Test { params, lang } => match params.as_slice() {
+            [pid] => cmd_test(None, pid, lang.as_deref())?,
+            [cid, pid] => cmd_test(Some(cid), pid, lang.as_deref())?,
             _ => anyhow::bail!("Usage: kp test [contest_id] <problem_id>"),
         },
         Commands::Submit {
             contest_id,
             problem_id,
-        } => cmd_submit(contest_id.as_deref(), &problem_id)?,
+            lang,
+        } => cmd_submit(contest_id.as_deref(), &problem_id, lang.as_deref())?,
         Commands::Open {
             contest_id,
             problem_id,
@@ -114,8 +166,8 @@ fn main() -> Result<()> {
 /// サブコマンド
 /// ==============================
 
-fn cmd_init() -> Result<()> {
-    ensure_tools(&["acc", "oj", "git", "cargo"])?;
+fn cmd_init(repository: Option<&str>) -> Result<()> {
+    ensure_tools(&["acc", "oj", "git"])?;
     let acc_conf = acc_config_dir()?;
 
     let cfg_path = acc_conf.join(CONFIG_FILE_NAME);
@@ -123,21 +175,35 @@ fn cmd_init() -> Result<()> {
         save_config(&acc_conf, &KpConfig::default())?;
     }
 
-    let cfg = load_config(&acc_conf)?;
-
-    let tpl_dir = acc_conf.join("kp-rust");
+    let mut cfg = load_config(&acc_conf)?;
+    if let Some(repo) = repository {
+        cfg.template_repository_url = repo.to_string();
+        let lang = cfg.default_language.clone();
+        cfg.language
+            .entry(lang)
+            .or_default()
+            .template_repository_url = Some(repo.to_string());
+        save_config(&acc_conf, &cfg)?;
+    }
+    let lang = select_language(&cfg, None)?;
+    let lang_cfg = get_language_config(&cfg, &lang)?;
+    let tpl_repo = lang_cfg
+        .template_repository_url
+        .as_deref()
+        .unwrap_or(&cfg.template_repository_url);
+    let tpl_dir_name = lang_cfg
+        .template_dir
+        .clone()
+        .unwrap_or_else(|| format!("kp-{}", lang));
+    let tpl_dir = acc_conf.join(&tpl_dir_name);
     if tpl_dir.exists() {
         run_in("git", &["pull"], &tpl_dir)?;
     } else {
-        run_in(
-            "git",
-            &["clone", &cfg.template_repository_url, "kp-rust"],
-            &acc_conf,
-        )?;
+        run_in("git", &["clone", tpl_repo, &tpl_dir_name], &acc_conf)?;
     }
 
     // acc 設定
-    run("acc", &["config", "default-template", "kp-rust"])?;
+    run("acc", &["config", "default-template", &tpl_dir_name])?;
     run("acc", &["config", "default-task-dirname-format", "./"])?;
     run("acc", &["config", "default-task-choice", "all"])?;
     println!("✅ Initialized successfully");
@@ -170,11 +236,22 @@ fn cmd_config_set(key: &str, new_value: &str) -> Result<()> {
         "template_repository_url" => {
             doc["template_repository_url"] = toml_val(new_value.to_string());
         }
+        "default_language" => {
+            doc["default_language"] = toml_val(new_value.to_string());
+        }
         "minify_on_submit" => {
             let parsed = new_value
                 .parse::<bool>()
                 .context("minify_on_submit must be true/false")?;
             doc["minify_on_submit"] = toml_val(parsed);
+        }
+        _ if key.starts_with("language.") => {
+            // language.<lang>.<field>
+            let rest = key.trim_start_matches("language.");
+            let (lang, field) = rest
+                .split_once('.')
+                .context("language.* must be like language.<lang>.<field>")?;
+            doc["language"][lang][field] = toml_val(new_value.to_string());
         }
         _ => anyhow::bail!("Unknown key: {}", key),
     }
@@ -191,13 +268,33 @@ fn cmd_config_set(key: &str, new_value: &str) -> Result<()> {
         _ => false,
     };
     if changed_template {
-        cmd_init()?; // テンプレ取得や acc 既定設定を反映
+        cmd_init(None)?; // テンプレ取得や acc 既定設定を反映
     }
 
     Ok(())
 }
 
-fn cmd_new(contest_id: &str, open_flag: bool) -> Result<()> {
+fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> {
+    let acc_conf = acc_config_dir()?;
+    let cfg = load_config(&acc_conf)?;
+    let lang = select_language(&cfg, lang)?;
+    let lang_cfg = get_language_config(&cfg, &lang)?;
+    let tpl_repo = lang_cfg
+        .template_repository_url
+        .as_deref()
+        .unwrap_or(&cfg.template_repository_url);
+    let tpl_dir_name = lang_cfg
+        .template_dir
+        .clone()
+        .unwrap_or_else(|| format!("kp-{}", lang));
+    let tpl_dir = acc_conf.join(&tpl_dir_name);
+    if tpl_dir.exists() {
+        run_in("git", &["pull"], &tpl_dir)?;
+    } else {
+        run_in("git", &["clone", tpl_repo, &tpl_dir_name], &acc_conf)?;
+    }
+    run("acc", &["config", "default-template", &tpl_dir_name])?;
+
     run("acc", &["new", contest_id])?;
     let root = PathBuf::from(contest_id);
     let cargo_toml = root.join("Cargo.toml");
@@ -215,12 +312,19 @@ fn cmd_new(contest_id: &str, open_flag: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_test(contest_id: Option<&str>, problem_id: &str) -> Result<()> {
+fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> Result<()> {
     let dir = contest_id
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     let test_dir = format!("tests/{problem_id}");
-    let cmd = format!("cargo run --bin {problem_id}");
+    let cfg = load_config(&acc_config_dir()?)?;
+    let lang = select_language(&cfg, lang)?;
+    let lang_cfg = get_language_config(&cfg, &lang)?;
+    let cmd_tpl = lang_cfg
+        .test_command
+        .as_deref()
+        .unwrap_or("cargo run --bin {problem_id}");
+    let cmd = apply_command_template(cmd_tpl, contest_id, problem_id);
     // On Windows, ask oj to run `cmd /C <command>` so it executes via cmd
     let args_owned: Vec<String> = if cfg!(target_os = "windows") {
         let wrapped = format!("cmd /C {}", cmd);
@@ -245,13 +349,19 @@ fn cmd_test(contest_id: Option<&str>, problem_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_submit(contest_id: Option<&str>, problem_id: &str) -> Result<()> {
+fn cmd_submit(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> Result<()> {
     let dir = contest_id
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     let test_dir = format!("tests/{problem_id}");
-    let cmd = format!("cargo run --bin {problem_id}");
     let cfg = load_config(&acc_config_dir()?)?;
+    let lang = select_language(&cfg, lang)?;
+    let lang_cfg = get_language_config(&cfg, &lang)?;
+    let cmd_tpl = lang_cfg
+        .submit_command
+        .as_deref()
+        .unwrap_or("cargo run --bin {problem_id}");
+    let cmd = apply_command_template(cmd_tpl, contest_id, problem_id);
     if cfg.minify_on_submit {
         println!("⚠️ minify_on_submit=true, but minify is not implemented yet");
     }
@@ -276,6 +386,33 @@ fn cmd_submit(contest_id: Option<&str>, problem_id: &str) -> Result<()> {
     let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
     run_in("oj", &args, &dir)?;
     Ok(())
+}
+
+fn select_language(cfg: &KpConfig, override_lang: Option<&str>) -> Result<String> {
+    let lang = override_lang
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| cfg.default_language.clone());
+    if cfg.language.contains_key(&lang) {
+        return Ok(lang);
+    }
+    // fallback for legacy config: allow rust
+    if lang == "rust" {
+        return Ok(lang);
+    }
+    anyhow::bail!("Unknown language: {}", lang)
+}
+
+fn get_language_config<'a>(cfg: &'a KpConfig, lang: &str) -> Result<&'a LanguageConfig> {
+    cfg.language
+        .get(lang)
+        .ok_or_else(|| anyhow::anyhow!("language config missing: {}", lang))
+}
+
+fn apply_command_template(cmd: &str, contest_id: Option<&str>, problem_id: &str) -> String {
+    let mut out = cmd.replace("{problem_id}", problem_id);
+    let contest_val = contest_id.unwrap_or("");
+    out = out.replace("{contest_id}", contest_val);
+    out
 }
 
 // JSON structures for contest.acc.json (partial)
@@ -441,7 +578,23 @@ fn load_config(acc_conf: &Path) -> Result<KpConfig> {
         return Ok(KpConfig::default());
     }
     let text = fs::read_to_string(&path)?;
-    Ok(toml_edit::de::from_str(&text)?)
+    let mut cfg: KpConfig = toml_edit::de::from_str(&text)?;
+    // migrate legacy fields into language.rust if missing
+    if !cfg.language.contains_key("rust") {
+        cfg.language.insert(
+            "rust".to_string(),
+            LanguageConfig {
+                template_repository_url: Some(cfg.template_repository_url.clone()),
+                template_dir: Some("kp-rust".to_string()),
+                test_command: Some("cargo run --bin {problem_id}".to_string()),
+                submit_command: Some("cargo run --bin {problem_id}".to_string()),
+            },
+        );
+    }
+    if cfg.default_language.is_empty() {
+        cfg.default_language = default_language();
+    }
+    Ok(cfg)
 }
 
 fn save_config(acc_conf: &Path, cfg: &KpConfig) -> Result<()> {
