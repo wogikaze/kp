@@ -104,24 +104,6 @@ oj submit -c "cargo run --bin {problem_id}" -d {problem_id}/tests
 # ブラウザで問題ページを開く
 ```
 
-### temp
-
-`$ kp temp {contest_id} {problem_id} (--test|--submit)`
-一問だけ解きたいときに使うコマンド。
---testでテスト実行、--submitで提出を行う。
-ファイル構造は以下のようになる。
-
-```
-temp/
-  └── Cargo.toml
-  └── src/
-      └── {contest_id}{problem_id}.rs
-  └── {contest_id}{problem_id}_tests/
-```
-実行される内容:
-- Cargo.tomlに[[bin]]セクションの追加, nameの設定
-- テストディレクトリの作成
-
 ## 今後の対応予定
 
 ### すぐに対応させられること
