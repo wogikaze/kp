@@ -760,8 +760,10 @@ fn open_in_browser(url: &str) -> Result<()> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if Command::new("xdg-open").arg(url).spawn().is_ok() {
-            return Ok(());
+        if let Ok(status) = Command::new("xdg-open").arg(url).status() {
+            if status.success() {
+                return Ok(());
+            }
         }
         Command::new("/mnt/c/Windows/explorer.exe")
             .arg(url)
