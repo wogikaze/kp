@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
@@ -28,6 +29,21 @@ enum Commands {
         /// template repository URL override (also updates config)
         #[arg(long)]
         repository: Option<String>,
+    },
+    /// AtCoder の REVEL_SESSION を acc / oj に保存
+    Login {
+        /// 保存先ツール名 (例: --tools oj acc)。省略時は自動検出
+        #[arg(long, num_args = 1..)]
+        tools: Vec<String>,
+        /// REVEL_SESSION の値。省略時は対話入力
+        #[arg(long)]
+        session: Option<String>,
+        /// oj の cookie.jar パスを上書き
+        #[arg(long)]
+        oj_cookie_path: Option<PathBuf>,
+        /// acc の session.json パスを上書き
+        #[arg(long)]
+        acc_cookie_path: Option<PathBuf>,
     },
     /// 設定を一覧または変更
     Config {
@@ -145,6 +161,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { repository } => cmd_init(repository.as_deref())?,
+        Commands::Login {
+            tools,
+            session,
+            oj_cookie_path,
+            acc_cookie_path,
+        } => cmd_login(
+            &tools,
+            session.as_deref(),
+            oj_cookie_path.as_deref(),
+            acc_cookie_path.as_deref(),
+        )?,
         Commands::Config { sub } => match sub {
             ConfigSub::List => cmd_config_list()?,
             ConfigSub::Set { key, value } => cmd_config_set(&key, &value)?,
@@ -223,6 +250,75 @@ fn cmd_init(repository: Option<&str>) -> Result<()> {
     run("acc", &["config", "default-task-choice", "all"])?;
     println!("✅ Initialized successfully");
     Ok(())
+}
+
+fn cmd_login(
+    specified_tools: &[String],
+    session: Option<&str>,
+    oj_cookie_path: Option<&Path>,
+    acc_cookie_path: Option<&Path>,
+) -> Result<()> {
+    let tools = resolve_login_tools(specified_tools)?;
+    if tools.is_empty() {
+        anyhow::bail!("エラー: 対応するツールがインストールされていません");
+    }
+
+    println!("検知されたツール:");
+    for tool in &tools {
+        println!("- {}", tool.name());
+    }
+
+    let cookie_value = match session {
+        Some(value) => normalize_revel_session_input(value),
+        None => prompt_revel_session()?,
+    };
+    if cookie_value.is_empty() {
+        anyhow::bail!("エラー: クッキーが入力されていません");
+    }
+
+    let mut success_count = 0usize;
+    let mut errors = Vec::new();
+    for tool in tools {
+        let result = match tool {
+            LoginTool::Oj => {
+                let path = match oj_cookie_path {
+                    Some(path) => path.to_path_buf(),
+                    None => default_oj_cookie_path()?,
+                };
+                store_oj_session_cookie(&path, &cookie_value)
+            }
+            LoginTool::Acc => {
+                let path = match acc_cookie_path {
+                    Some(path) => path.to_path_buf(),
+                    None => acc_config_dir()?.join("session.json"),
+                };
+                store_acc_session_cookie(&path, &cookie_value)
+            }
+        };
+        match result {
+            Ok(()) => success_count += 1,
+            Err(err) => errors.push(format!("{}: {}", tool.name(), err)),
+        }
+    }
+
+    if errors.is_empty() {
+        println!(
+            "✅ すべてのツール ({}/{}) にクッキーを保存しました",
+            success_count, success_count
+        );
+        return Ok(());
+    }
+
+    if success_count > 0 {
+        anyhow::bail!(
+            "⚠️ 一部のツール ({}/{}) にクッキーを保存しました: {}",
+            success_count,
+            success_count + errors.len(),
+            errors.join(" / ")
+        );
+    }
+
+    anyhow::bail!("❌ クッキーの保存に失敗しました: {}", errors.join(" / "))
 }
 
 fn cmd_config_list() -> Result<()> {
@@ -496,6 +592,29 @@ struct TaskEntry {
     directory: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoginTool {
+    Oj,
+    Acc,
+}
+
+impl LoginTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Oj => "oj",
+            Self::Acc => "acc",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "oj" => Some(Self::Oj),
+            "acc" => Some(Self::Acc),
+            _ => None,
+        }
+    }
+}
+
 /// Open logic per user's spec:
 /// - kp open (contest_id) (problem_id)
 /// - If contest_id omitted: look for contest.acc.json in cwd, error if missing
@@ -564,24 +683,243 @@ fn cmd_open(contest_id: Option<&str>, problem_id: Option<&str>) -> Result<()> {
 
 fn ensure_tools(tools: &[&str]) -> Result<()> {
     for tool in tools {
-        let checker = if cfg!(target_os = "windows") {
-            "where"
-        } else {
-            "which"
-        };
-        let status = Command::new(checker)
-            .arg(tool)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .with_context(|| format!("failed to run `{}` to check for {}", checker, tool))?;
-        if !status.success() {
+        if !command_exists(tool)? {
             // Provide PATH context to help debugging
             let path = std::env::var("PATH").unwrap_or_default();
             anyhow::bail!("Required tool '{}' not found in PATH. Please install it and ensure it's on your PATH. PATH={}", tool, path);
         }
     }
     Ok(())
+}
+
+fn command_exists(cmd: &str) -> Result<bool> {
+    let checker = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+    let status = Command::new(checker)
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("failed to run `{}` to check for {}", checker, cmd))?;
+    Ok(status.success())
+}
+
+fn resolve_login_tools(specified_tools: &[String]) -> Result<Vec<LoginTool>> {
+    let candidates = [LoginTool::Oj, LoginTool::Acc];
+    let mut tools = Vec::new();
+
+    if specified_tools.is_empty() {
+        for tool in candidates {
+            if command_exists(tool.name())? {
+                tools.push(tool);
+            }
+        }
+        return Ok(tools);
+    }
+
+    for tool_name in specified_tools {
+        match LoginTool::from_name(tool_name) {
+            Some(tool) => {
+                if command_exists(tool.name())? {
+                    if !tools.contains(&tool) {
+                        tools.push(tool);
+                    }
+                } else {
+                    eprintln!("警告: {} はインストールされていないようです", tool_name);
+                }
+            }
+            None => eprintln!("警告: {} は未対応のツールです", tool_name),
+        }
+    }
+
+    Ok(tools)
+}
+
+fn prompt_revel_session() -> Result<String> {
+    print!("AtCoder の REVEL_SESSION クッキーを貼り付けてください: ");
+    io::stdout().flush().context("failed to flush stdout")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read REVEL_SESSION")?;
+    Ok(normalize_revel_session_input(&input))
+}
+
+fn normalize_revel_session_input(input: &str) -> String {
+    let trimmed = input.trim();
+    let without_prefix = trimmed.strip_prefix("REVEL_SESSION=").unwrap_or(trimmed);
+    let value = without_prefix
+        .split(';')
+        .next()
+        .unwrap_or(without_prefix)
+        .trim();
+    value.to_string()
+}
+
+fn default_oj_cookie_path() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .context("LOCALAPPDATA or APPDATA is not set")?;
+        Ok(PathBuf::from(base)
+            .join("online-judge-tools")
+            .join("cookie.jar"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("online-judge-tools")
+            .join("cookie.jar"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            })
+            .context("XDG_DATA_HOME or HOME is not set")?;
+        Ok(base.join("online-judge-tools").join("cookie.jar"))
+    }
+}
+
+fn store_acc_session_cookie(path: &Path, cookie_value: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("failed to determine parent of {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let existing = if path.exists() {
+        Some(
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let updated = update_acc_session_json(existing.as_deref(), cookie_value)?;
+    fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+    println!("✅ acc: クッキーを {} に保存しました", path.display());
+    Ok(())
+}
+
+fn update_acc_session_json(existing: Option<&str>, cookie_value: &str) -> Result<String> {
+    use serde_json::{Map, Value};
+
+    let mut value = match existing {
+        Some(text) => serde_json::from_str(text).unwrap_or_else(|_| Value::Object(Map::new())),
+        None => Value::Object(Map::new()),
+    };
+
+    let object = value
+        .as_object_mut()
+        .context("acc session.json must contain a JSON object")?;
+
+    let mut cookies = Vec::new();
+    let mut has_flash = false;
+    let mut has_session = false;
+    if let Some(existing_cookies) = object.get("cookies").and_then(|value| value.as_array()) {
+        for entry in existing_cookies {
+            let Some(cookie) = entry.as_str() else {
+                continue;
+            };
+            if cookie.starts_with("REVEL_SESSION=") {
+                if !has_session {
+                    cookies.push(format!("REVEL_SESSION={}", cookie_value));
+                    has_session = true;
+                }
+                continue;
+            }
+            if cookie.starts_with("REVEL_FLASH=") {
+                has_flash = true;
+            }
+            cookies.push(cookie.to_string());
+        }
+    }
+
+    if !has_flash {
+        cookies.insert(0, "REVEL_FLASH=".to_string());
+    }
+    if !has_session {
+        cookies.push(format!("REVEL_SESSION={}", cookie_value));
+    }
+
+    object.insert(
+        "cookies".to_string(),
+        Value::Array(cookies.into_iter().map(Value::String).collect()),
+    );
+    let text = serde_json::to_string_pretty(&value).context("failed to format acc session.json")?;
+    Ok(format!("{}\n", text))
+}
+
+fn store_oj_session_cookie(path: &Path, cookie_value: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("failed to determine parent of {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let existing = if path.exists() {
+        Some(
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let updated = update_oj_cookie_jar(existing.as_deref(), cookie_value);
+    fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+    println!("✅ oj: クッキーを {} に保存しました", path.display());
+    Ok(())
+}
+
+fn update_oj_cookie_jar(existing: Option<&str>, cookie_value: &str) -> String {
+    let mut lines = vec!["#LWP-Cookies-2.0".to_string()];
+
+    if let Some(text) = existing {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed == "#LWP-Cookies-2.0"
+                || trimmed.starts_with("Set-Cookie3: REVEL_SESSION=")
+            {
+                continue;
+            }
+            lines.push(line.to_string());
+        }
+    }
+
+    lines.push(format!(
+        "Set-Cookie3: {}",
+        format_oj_revel_session_cookie(cookie_value)
+    ));
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn format_oj_revel_session_cookie(cookie_value: &str) -> String {
+    format!(
+        "REVEL_SESSION={}; path={}; domain={}; path_spec; secure; expires={}; HttpOnly=None; version=0",
+        format_lwp_cookie_value(cookie_value),
+        format_lwp_cookie_value("/"),
+        format_lwp_cookie_value("atcoder.jp"),
+        format_lwp_cookie_value("2099-12-31 23:59:59Z"),
+    )
+}
+
+fn format_lwp_cookie_value(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return value.to_string();
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
 }
 
 // Run a command in a platform-appropriate way. On Windows, use `cmd /C` so
@@ -913,6 +1251,110 @@ path = "src/existing.rs"
             other => anyhow::bail!("unexpected command: {:?}", other),
         }
         Ok(())
+    }
+
+    #[test]
+    fn cli_login_parses_options() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "kp",
+            "login",
+            "--tools",
+            "oj",
+            "acc",
+            "--session",
+            "REVEL_SESSION=abc123",
+            "--oj-cookie-path",
+            "/tmp/oj-cookie.jar",
+            "--acc-cookie-path",
+            "/tmp/acc-session.json",
+        ])?;
+        match cli.command {
+            Commands::Login {
+                tools,
+                session,
+                oj_cookie_path,
+                acc_cookie_path,
+            } => {
+                assert_eq!(tools, vec!["oj", "acc"]);
+                assert_eq!(session.as_deref(), Some("REVEL_SESSION=abc123"));
+                assert_eq!(oj_cookie_path, Some(PathBuf::from("/tmp/oj-cookie.jar")));
+                assert_eq!(
+                    acc_cookie_path,
+                    Some(PathBuf::from("/tmp/acc-session.json"))
+                );
+            }
+            other => anyhow::bail!("unexpected command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_revel_session_input_accepts_cookie_assignment() {
+        assert_eq!(
+            normalize_revel_session_input("REVEL_SESSION=abc123"),
+            "abc123"
+        );
+        assert_eq!(
+            normalize_revel_session_input("REVEL_SESSION=abc123; Path=/; Secure"),
+            "abc123"
+        );
+        assert_eq!(normalize_revel_session_input("  abc123  "), "abc123");
+    }
+
+    #[test]
+    fn update_acc_session_json_preserves_other_fields() -> Result<()> {
+        let updated = update_acc_session_json(
+            Some(
+                r#"{
+  "cookies": [
+    "REVEL_FLASH=",
+    "foo=bar",
+    "REVEL_SESSION=old"
+  ],
+  "metadata": {
+    "user": "wogikaze"
+  }
+}"#,
+            ),
+            "new",
+        )?;
+
+        let value: serde_json::Value = serde_json::from_str(&updated)?;
+        assert_eq!(
+            value["cookies"],
+            serde_json::json!(["REVEL_FLASH=", "foo=bar", "REVEL_SESSION=new"])
+        );
+        assert_eq!(value["metadata"]["user"], "wogikaze");
+        Ok(())
+    }
+
+    #[test]
+    fn update_acc_session_json_adds_flash_cookie_when_missing() -> Result<()> {
+        let updated = update_acc_session_json(Some(r#"{"cookies":["foo=bar"]}"#), "new")?;
+        let value: serde_json::Value = serde_json::from_str(&updated)?;
+        assert_eq!(
+            value["cookies"],
+            serde_json::json!(["REVEL_FLASH=", "foo=bar", "REVEL_SESSION=new"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_oj_cookie_jar_replaces_revel_session_and_keeps_other_lines() {
+        let updated = update_oj_cookie_jar(
+            Some(
+                "#LWP-Cookies-2.0\nSet-Cookie3: other=value; path=\"/\"; domain=\"example.com\"; path_spec; version=0\nSet-Cookie3: REVEL_SESSION=old; path=\"/\"; domain=\"atcoder.jp\"; path_spec; secure; version=0\n",
+            ),
+            "new=value",
+        );
+
+        assert!(updated.contains("#LWP-Cookies-2.0\n"));
+        assert!(updated.contains(
+            "Set-Cookie3: other=value; path=\"/\"; domain=\"example.com\"; path_spec; version=0\n"
+        ));
+        assert!(!updated.contains("REVEL_SESSION=old"));
+        assert!(updated.contains("Set-Cookie3: REVEL_SESSION=\"new=value\"; path=\"/\"; domain=\"atcoder.jp\"; path_spec; secure; expires=\"2099-12-31 23:59:59Z\"; HttpOnly=None; version=0\n"));
+        assert!(updated.ends_with('\n'));
     }
 
     #[test]

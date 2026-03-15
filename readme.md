@@ -15,6 +15,9 @@
 - **問題の実行**  
   `kp.exe run [contestID] <problem_label> [--debug]` を実行することで、移動せずに対象コンテスト配下で `cargo run --bin ...` を実行できます。
 
+- **ログイン復旧**  
+  `kp.exe login` で AtCoder の `REVEL_SESSION` を `acc` / `oj` に保存し、ログイン状態を復旧できます。
+
 ## 必要環境
 
 - **Rust & Cargo**  
@@ -87,6 +90,21 @@ kp.exe run abc300 a
 ```
 
 このコマンドは `abc300` ディレクトリ内で `cargo run --bin a --release` を実行します。`--debug` を付けた場合は `--release` を付けません。
+
+### ログイン状態の復旧
+
+以下のコマンドで、AtCoder の `REVEL_SESSION` を `acc` / `oj` に保存できます。  
+例:
+
+```bash
+kp.exe login
+```
+
+対話入力の代わりに `--session` で直接渡すこともできます。
+
+```bash
+kp.exe login --session "REVEL_SESSION=..."
+```
 
 ## コマンド実行の詳細
 
