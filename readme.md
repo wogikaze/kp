@@ -64,6 +64,7 @@ kp.exe new abc300
 ```
 
 このコマンドにより、コンテスト番号300のプロジェクト「abc300」が作成され、各サブディレクトリで`cargo run`が実行されます。
+`kp.exe new https://atcoder.jp/contests/abc300` のようにコンテスト URL をそのまま渡しても作成できます。
 
 ### 問題のテスト
 

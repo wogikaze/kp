@@ -36,6 +36,7 @@ enum Commands {
     },
     /// 新しいコンテストプロジェクトを作成
     New {
+        /// contest id (e.g. abc411) or contest URL (e.g. https://atcoder.jp/contests/abc411)
         contest_id: String,
         #[arg(long)]
         open: bool,
@@ -289,6 +290,7 @@ fn cmd_config_set(key: &str, new_value: &str) -> Result<()> {
 }
 
 fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> {
+    let contest_id = normalize_contest_id_input(contest_id)?;
     let acc_conf = acc_config_dir()?;
     let cfg = load_config(&acc_conf)?;
     let lang = select_language(&cfg, lang)?;
@@ -309,14 +311,14 @@ fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> 
     }
     run("acc", &["config", "default-template", &tpl_dir_name])?;
 
-    run("acc", &["new", contest_id])?;
-    let root = PathBuf::from(contest_id);
+    run("acc", &["new", &contest_id])?;
+    let root = PathBuf::from(&contest_id);
     let cargo_toml = root.join("Cargo.toml");
     if cargo_toml.exists() {
-        append_bins(&cargo_toml, &root, contest_id)?;
+        append_bins(&cargo_toml, &root, &contest_id)?;
     }
     // Add the contest Cargo.toml to workspace VSCode linkedProjects for rust-analyzer
-    if let Err(e) = add_vscode_linked_project(contest_id) {
+    if let Err(e) = add_vscode_linked_project(&contest_id) {
         eprintln!("warning: failed to update .vscode/settings.json: {}", e);
     }
     if open_flag {
@@ -445,6 +447,30 @@ fn cargo_run_args(bin: &str, debug: bool) -> Vec<String> {
         args.push("--release".to_string());
     }
     args
+}
+
+fn normalize_contest_id_input(input: &str) -> Result<String> {
+    for prefix in [
+        "https://atcoder.jp/contests/",
+        "http://atcoder.jp/contests/",
+    ] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            let path = rest
+                .split(['?', '#'])
+                .next()
+                .unwrap_or_default()
+                .trim_matches('/');
+            let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+            let contest_id = segments
+                .next()
+                .context("contest URL must include a contest id")?;
+            if segments.next().is_some() {
+                anyhow::bail!("contest URL must point to a contest page: {}", input);
+            }
+            return Ok(contest_id.to_string());
+        }
+    }
+    Ok(input.to_string())
 }
 
 // JSON structures for contest.acc.json (partial)
@@ -831,6 +857,39 @@ path = "src/existing.rs"
     }
 
     #[test]
+    fn normalize_contest_id_keeps_plain_id() -> Result<()> {
+        assert_eq!(normalize_contest_id_input("abc411")?, "abc411");
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_contest_id_accepts_contest_url() -> Result<()> {
+        assert_eq!(
+            normalize_contest_id_input("https://atcoder.jp/contests/abc411")?,
+            "abc411"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_contest_id_accepts_trailing_slash_and_query() -> Result<()> {
+        assert_eq!(
+            normalize_contest_id_input("https://atcoder.jp/contests/abc411/?lang=ja")?,
+            "abc411"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_contest_id_rejects_non_contest_url() {
+        let err = normalize_contest_id_input("https://atcoder.jp/contests/abc411/tasks/abc411_a")
+            .expect_err("task URL should be rejected");
+        assert!(err
+            .to_string()
+            .contains("contest URL must point to a contest page"));
+    }
+
+    #[test]
     fn cli_run_parses_bin_only() -> Result<()> {
         let cli = Cli::try_parse_from(["kp", "run", "a"])?;
         match cli.command {
@@ -882,11 +941,7 @@ path = "src/existing.rs"
         assert_eq!(value["editor.tabSize"], 2);
         assert_eq!(
             value["rust-analyzer.linkedProjects"],
-            serde_json::json!([
-                "./aaa/Cargo.toml",
-                "./bbb/Cargo.toml",
-                "./zzz/Cargo.toml"
-            ])
+            serde_json::json!(["./aaa/Cargo.toml", "./bbb/Cargo.toml", "./zzz/Cargo.toml"])
         );
         Ok(())
     }
@@ -900,9 +955,7 @@ path = "src/existing.rs"
 
         let err = update_vscode_linked_project_settings(&settings_path, "abc999")
             .expect_err("invalid JSONC should return an error");
-        assert!(err
-            .to_string()
-            .contains("failed to parse"));
+        assert!(err.to_string().contains("failed to parse"));
         assert_eq!(fs::read_to_string(&settings_path)?, original);
         Ok(())
     }
@@ -968,7 +1021,11 @@ fn update_vscode_linked_project_settings(settings_path: &Path, contest_id: &str)
             .into_iter()
             .map(|value| match value {
                 Value::String(path) => Ok(path),
-                _ => anyhow::bail!("`{}` in {} must be an array of strings", key, settings_path.display()),
+                _ => anyhow::bail!(
+                    "`{}` in {} must be an array of strings",
+                    key,
+                    settings_path.display()
+                ),
             })
             .collect::<Result<Vec<_>>>()?,
         Some(_) => anyhow::bail!(

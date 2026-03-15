@@ -1,6 +1,5 @@
 {
   "rust-analyzer.linkedProjects": [
-    "./Cargo.toml",
-    "./https://atcoder.jp/contests/abc411/Cargo.toml"
+    "./Cargo.toml"
   ]
 }
