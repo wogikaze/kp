@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::collections::BTreeMap;
 use toml_edit::DocumentMut;
 
 /// ==============================
@@ -740,7 +740,9 @@ fn add_vscode_linked_project(contest_id: &str) -> Result<()> {
     };
 
     // Check presence
-    let exists = arr.iter().any(|v| v.as_str().map(|s| s == new_entry).unwrap_or(false));
+    let exists = arr
+        .iter()
+        .any(|v| v.as_str().map(|s| s == new_entry).unwrap_or(false));
     if !exists {
         arr.push(Value::String(new_entry));
         let out = serde_json::to_string_pretty(&value)?;
