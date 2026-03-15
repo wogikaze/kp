@@ -12,6 +12,9 @@
 - **ビルドとテスト**  
   `kp.exe test <contestID> <problem_label>`を実行することで、指定した問題のビルドとテストを実行します。
 
+- **問題の実行**  
+  `kp.exe run [contestID] <problem_label> [--debug]` を実行することで、移動せずに対象コンテスト配下で `cargo run --bin ...` を実行できます。
+
 ## 必要環境
 
 - **Rust & Cargo**  
@@ -72,6 +75,17 @@ kp.exe test abc300 a
 ```
 
 このコマンドは、プロジェクト内のディレクトリで`oj test`を順次実行します。
+
+### 問題の実行
+
+以下のコマンドで、指定した問題のバイナリを実行できます。  
+例:
+
+```bash
+kp.exe run abc300 a
+```
+
+このコマンドは `abc300` ディレクトリ内で `cargo run --bin a --release` を実行します。`--debug` を付けた場合は `--release` を付けません。
 
 ## コマンド実行の詳細
 

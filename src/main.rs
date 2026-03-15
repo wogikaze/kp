@@ -3,10 +3,9 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use toml_edit::DocumentMut;
+use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 /// ==============================
 /// 定義
@@ -52,6 +51,16 @@ enum Commands {
         /// language key (e.g. rust, cpp). If omitted, use default_language from config
         #[arg(long)]
         lang: Option<String>,
+    },
+    /// cargo run を実行
+    /// Usage: kp run [contest_id] <bin> [--debug]
+    Run {
+        /// contest id (optional). If omitted, current dir is used.
+        #[arg(num_args = 1..=2)]
+        params: Vec<String>,
+        /// debug build で実行する (--release を付けない)
+        #[arg(long)]
+        debug: bool,
     },
     /// 提出
     Submit {
@@ -114,8 +123,8 @@ impl Default for KpConfig {
             LanguageConfig {
                 template_repository_url: Some(DEFAULT_TEMPLATE_URL.to_string()),
                 template_dir: Some("kp-rust".to_string()),
-                test_command: Some("cargo run --bin {problem_id}".to_string()),
-                submit_command: Some("cargo run --bin {problem_id}".to_string()),
+                test_command: Some("cargo run --bin {problem_id} --release".to_string()),
+                submit_command: Some("cargo run --bin {problem_id} --release".to_string()),
             },
         );
         Self {
@@ -148,6 +157,11 @@ fn main() -> Result<()> {
             [pid] => cmd_test(None, pid, lang.as_deref())?,
             [cid, pid] => cmd_test(Some(cid), pid, lang.as_deref())?,
             _ => anyhow::bail!("Usage: kp test [contest_id] <problem_id>"),
+        },
+        Commands::Run { params, debug } => match params.as_slice() {
+            [bin] => cmd_run(None, bin, debug)?,
+            [cid, bin] => cmd_run(Some(cid), bin, debug)?,
+            _ => anyhow::bail!("Usage: kp run [contest_id] <bin> [--debug]"),
         },
         Commands::Submit {
             contest_id,
@@ -323,7 +337,7 @@ fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> R
     let cmd_tpl = lang_cfg
         .test_command
         .as_deref()
-        .unwrap_or("cargo run --bin {problem_id}");
+        .unwrap_or("cargo run --bin {problem_id} --release");
     let cmd = apply_command_template(cmd_tpl, contest_id, problem_id);
     // On Windows, ask oj to run `cmd /C <command>` so it executes via cmd
     let args_owned: Vec<String> = if cfg!(target_os = "windows") {
@@ -349,6 +363,16 @@ fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> R
     Ok(())
 }
 
+fn cmd_run(contest_id: Option<&str>, bin: &str, debug: bool) -> Result<()> {
+    let dir = contest_id
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    let args_owned = cargo_run_args(bin, debug);
+    let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
+    run_in("cargo", &args, &dir)?;
+    Ok(())
+}
+
 fn cmd_submit(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> Result<()> {
     let dir = contest_id
         .map(PathBuf::from)
@@ -360,7 +384,7 @@ fn cmd_submit(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) ->
     let cmd_tpl = lang_cfg
         .submit_command
         .as_deref()
-        .unwrap_or("cargo run --bin {problem_id}");
+        .unwrap_or("cargo run --bin {problem_id} --release");
     let cmd = apply_command_template(cmd_tpl, contest_id, problem_id);
     if cfg.minify_on_submit {
         println!("⚠️ minify_on_submit=true, but minify is not implemented yet");
@@ -413,6 +437,14 @@ fn apply_command_template(cmd: &str, contest_id: Option<&str>, problem_id: &str)
     let contest_val = contest_id.unwrap_or("");
     out = out.replace("{contest_id}", contest_val);
     out
+}
+
+fn cargo_run_args(bin: &str, debug: bool) -> Vec<String> {
+    let mut args = vec!["run".to_string(), "--bin".to_string(), bin.to_string()];
+    if !debug {
+        args.push("--release".to_string());
+    }
+    args
 }
 
 // JSON structures for contest.acc.json (partial)
@@ -513,6 +545,8 @@ fn ensure_tools(tools: &[&str]) -> Result<()> {
         };
         let status = Command::new(checker)
             .arg(tool)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .with_context(|| format!("failed to run `{}` to check for {}", checker, tool))?;
         if !status.success() {
@@ -586,8 +620,8 @@ fn load_config(acc_conf: &Path) -> Result<KpConfig> {
             LanguageConfig {
                 template_repository_url: Some(cfg.template_repository_url.clone()),
                 template_dir: Some("kp-rust".to_string()),
-                test_command: Some("cargo run --bin {problem_id}".to_string()),
-                submit_command: Some("cargo run --bin {problem_id}".to_string()),
+                test_command: Some("cargo run --bin {problem_id} --release".to_string()),
+                submit_command: Some("cargo run --bin {problem_id} --release".to_string()),
             },
         );
     }
@@ -605,86 +639,295 @@ fn save_config(acc_conf: &Path, cfg: &KpConfig) -> Result<()> {
 }
 
 fn append_bins(cargo_toml: &Path, contest_dir: &Path, contest_id: &str) -> Result<()> {
-    // Read Cargo.toml text
-    let mut text = fs::read_to_string(cargo_toml)?;
-    let had_bins = text.contains("[[bin]]");
+    let text = fs::read_to_string(cargo_toml)
+        .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .with_context(|| format!("failed to parse {}", cargo_toml.display()))?;
 
-    // Set or insert package.name using simple string manipulation
-    if let Some(pkg_start) = text.find("[package]") {
-        // find end of package table (next table header like '\n[') or EOF
-        let rest = &text[pkg_start..];
-        let next_table = rest.find("\n[").map(|n| pkg_start + n);
-        let pkg_end = next_table.unwrap_or(text.len());
-        let pkg_section = &text[pkg_start..pkg_end];
+    match doc.get_mut("package") {
+        Some(item) => {
+            let package = item.as_table_mut().context("`package` must be a table")?;
+            package["name"] = value(contest_id);
+        }
+        None => {
+            let mut package = Table::new();
+            package["name"] = value(contest_id);
+            doc["package"] = Item::Table(package);
+        }
+    }
 
-        // Rebuild package section with name replaced/inserted
-        let mut new_pkg = String::new();
-        let mut name_replaced = false;
-        for (i, line) in pkg_section.lines().enumerate() {
-            if i == 0 {
-                new_pkg.push_str(line);
-                new_pkg.push('\n');
-                continue;
-            }
-            if !name_replaced && line.trim_start().starts_with("name") {
-                new_pkg.push_str(&format!("name = \"{}\"\n", contest_id));
-                name_replaced = true;
-            } else {
-                new_pkg.push_str(line);
-                new_pkg.push('\n');
+    let had_bins = match doc.get("bin") {
+        Some(item) => {
+            let bins = item
+                .as_array_of_tables()
+                .context("`bin` must be an array of tables when present")?;
+            !bins.is_empty()
+        }
+        None => false,
+    };
+
+    if !had_bins {
+        let contest_json = contest_dir.join("contest.acc.json");
+        if contest_json.exists() {
+            let cj_text = fs::read_to_string(&contest_json)
+                .with_context(|| format!("failed to read {}", contest_json.display()))?;
+            let cf: ContestFile =
+                serde_json::from_str(&cj_text).context("failed to parse contest.acc.json")?;
+
+            if !cf.tasks.is_empty() {
+                let mut bins = ArrayOfTables::new();
+                for task in &cf.tasks {
+                    let name = if let Some(s) = task.id.strip_prefix(&format!("{}_", contest_id)) {
+                        s.to_string()
+                    } else if let Some(label) = &task.label {
+                        label.to_lowercase()
+                    } else {
+                        task.id.clone()
+                    };
+                    let path = format!("src/{}.rs", name);
+                    let mut bin = Table::new();
+                    bin["name"] = value(name);
+                    bin["path"] = value(path);
+                    bins.push(bin);
+                }
+                doc["bin"] = Item::ArrayOfTables(bins);
             }
         }
-        if !name_replaced {
-            // insert name after the [package] header
-            let after_header = new_pkg.find('\n').map(|n| n + 1).unwrap_or(new_pkg.len());
-            new_pkg.insert_str(after_header, &format!("name = \"{}\"\n", contest_id));
-        }
-        text = format!("{}{}{}", &text[..pkg_start], new_pkg, &text[pkg_end..]);
-    } else {
-        // no package table: prepend one
-        text = format!("[package]\nname = \"{}\"\n\n{}", contest_id, text);
-    }
-    fs::write(cargo_toml, &text)?;
-
-    // If binary entries already exist, do not add more
-    if had_bins {
-        return Ok(());
     }
 
-    // Read contest.acc.json to get tasks
-    let contest_json = contest_dir.join("contest.acc.json");
-    if !contest_json.exists() {
-        return Ok(());
-    }
-    let cj_text = fs::read_to_string(&contest_json)?;
-    let cf: ContestFile =
-        serde_json::from_str(&cj_text).context("failed to parse contest.acc.json")?;
-
-    // Build [[bin]] entries
-    let mut bins_text = String::new();
-    for task in cf.tasks.iter() {
-        // Determine bin name: prefer short suffix (after contest_id + '_'), else label (lowercase), else full id
-        let name = if let Some(s) = task.id.strip_prefix(&format!("{}_", contest_id)) {
-            s.to_string()
-        } else if let Some(lbl) = &task.label {
-            lbl.to_lowercase()
-        } else {
-            task.id.clone()
-        };
-        let path = format!("src/{}.rs", name);
-        bins_text.push_str("\n[[bin]]\n");
-        bins_text.push_str(&format!("name = \"{}\"\n", name));
-        bins_text.push_str(&format!("path = \"{}\"\n", path));
-    }
-
-    let mut f = fs::OpenOptions::new().append(true).open(cargo_toml)?;
-    f.write_all(bins_text.as_bytes())?;
+    fs::write(cargo_toml, doc.to_string())
+        .with_context(|| format!("failed to write {}", cargo_toml.display()))?;
     Ok(())
 }
 
-fn add_vscode_linked_project(contest_id: &str) -> Result<()> {
-    use serde_json::{json, Value};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Result<Self> {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before UNIX_EPOCH")?
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("kp-{}-{}-{}", name, std::process::id(), unique));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn append_bins_updates_package_name_and_adds_bins() -> Result<()> {
+        let dir = TestDir::new("append-bins-adds")?;
+        let cargo_toml = dir.path().join("Cargo.toml");
+        fs::write(
+            &cargo_toml,
+            r#"[package]
+# keep this comment
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+"#,
+        )?;
+        fs::write(
+            dir.path().join("contest.acc.json"),
+            r#"{
+  "contest": { "id": "abc999", "title": "ABC999", "url": "https://example.com/contest" },
+  "tasks": [
+    { "id": "abc999_a", "label": "A", "title": "A", "url": "https://example.com/a", "directory": null },
+    { "id": "custom_task", "label": "B", "title": "B", "url": "https://example.com/b", "directory": null }
+  ]
+}"#,
+        )?;
+
+        append_bins(&cargo_toml, dir.path(), "abc999")?;
+
+        let text = fs::read_to_string(&cargo_toml)?;
+        assert!(text.contains("# keep this comment"));
+
+        let doc: DocumentMut = text.parse()?;
+        assert_eq!(doc["package"]["name"].as_str(), Some("abc999"));
+
+        let bins = doc["bin"].as_array_of_tables().unwrap();
+        assert_eq!(bins.len(), 2);
+        let first = bins.iter().next().unwrap();
+        let second = bins.iter().nth(1).unwrap();
+        assert_eq!(first["name"].as_str(), Some("a"));
+        assert_eq!(first["path"].as_str(), Some("src/a.rs"));
+        assert_eq!(second["name"].as_str(), Some("b"));
+        assert_eq!(second["path"].as_str(), Some("src/b.rs"));
+        Ok(())
+    }
+
+    #[test]
+    fn append_bins_keeps_existing_bin_entries() -> Result<()> {
+        let dir = TestDir::new("append-bins-keeps-existing")?;
+        let cargo_toml = dir.path().join("Cargo.toml");
+        fs::write(
+            &cargo_toml,
+            r#"[package]
+edition = "2021"
+name = "template"
+
+[[bin]]
+name = "existing"
+path = "src/existing.rs"
+"#,
+        )?;
+        fs::write(
+            dir.path().join("contest.acc.json"),
+            r#"{
+  "contest": { "id": "abc999", "title": "ABC999", "url": "https://example.com/contest" },
+  "tasks": [
+    { "id": "abc999_a", "label": "A", "title": "A", "url": "https://example.com/a", "directory": null }
+  ]
+}"#,
+        )?;
+
+        append_bins(&cargo_toml, dir.path(), "abc999")?;
+
+        let text = fs::read_to_string(&cargo_toml)?;
+        let doc: DocumentMut = text.parse()?;
+        assert_eq!(doc["package"]["name"].as_str(), Some("abc999"));
+
+        let bins = doc["bin"].as_array_of_tables().unwrap();
+        assert_eq!(bins.len(), 1);
+        let first = bins.iter().next().unwrap();
+        assert_eq!(first["name"].as_str(), Some("existing"));
+        assert_eq!(first["path"].as_str(), Some("src/existing.rs"));
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_run_args_use_release_by_default() {
+        assert_eq!(
+            cargo_run_args("a", false),
+            vec!["run", "--bin", "a", "--release"]
+        );
+    }
+
+    #[test]
+    fn cargo_run_args_skip_release_in_debug_mode() {
+        assert_eq!(cargo_run_args("a", true), vec!["run", "--bin", "a"]);
+    }
+
+    #[test]
+    fn cli_run_parses_bin_only() -> Result<()> {
+        let cli = Cli::try_parse_from(["kp", "run", "a"])?;
+        match cli.command {
+            Commands::Run { params, debug } => {
+                assert_eq!(params, vec!["a"]);
+                assert!(!debug);
+            }
+            other => anyhow::bail!("unexpected command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cli_run_parses_contest_bin_and_debug() -> Result<()> {
+        let cli = Cli::try_parse_from(["kp", "run", "abc300", "a", "--debug"])?;
+        match cli.command {
+            Commands::Run { params, debug } => {
+                assert_eq!(params, vec!["abc300", "a"]);
+                assert!(debug);
+            }
+            other => anyhow::bail!("unexpected command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn update_vscode_settings_accepts_jsonc_and_formats_output() -> Result<()> {
+        let dir = TestDir::new("vscode-settings-jsonc")?;
+        let settings_path = dir.path().join("settings.json");
+        fs::write(
+            &settings_path,
+            r#"{
+  // keep parsing comments
+  "editor.tabSize": 2,
+  "rust-analyzer.linkedProjects": [
+    "./zzz/Cargo.toml",
+    "./aaa/Cargo.toml"
+  ]
+}
+"#,
+        )?;
+
+        update_vscode_linked_project_settings(&settings_path, "bbb")?;
+
+        let text = fs::read_to_string(&settings_path)?;
+        assert!(text.ends_with('\n'));
+
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        assert_eq!(value["editor.tabSize"], 2);
+        assert_eq!(
+            value["rust-analyzer.linkedProjects"],
+            serde_json::json!([
+                "./aaa/Cargo.toml",
+                "./bbb/Cargo.toml",
+                "./zzz/Cargo.toml"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_vscode_settings_does_not_overwrite_invalid_jsonc() -> Result<()> {
+        let dir = TestDir::new("vscode-settings-invalid")?;
+        let settings_path = dir.path().join("settings.json");
+        let original = "{\n  \"editor.tabSize\": 2,,\n}\n";
+        fs::write(&settings_path, original)?;
+
+        let err = update_vscode_linked_project_settings(&settings_path, "abc999")
+            .expect_err("invalid JSONC should return an error");
+        assert!(err
+            .to_string()
+            .contains("failed to parse"));
+        assert_eq!(fs::read_to_string(&settings_path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn update_vscode_settings_rejects_invalid_linked_projects_type() -> Result<()> {
+        let dir = TestDir::new("vscode-settings-invalid-linked-projects")?;
+        let settings_path = dir.path().join("settings.json");
+        let original = r#"{
+  "rust-analyzer.linkedProjects": 1
+}
+"#;
+        fs::write(&settings_path, original)?;
+
+        let err = update_vscode_linked_project_settings(&settings_path, "abc999")
+            .expect_err("invalid linkedProjects type should return an error");
+        assert!(err
+            .to_string()
+            .contains("must be a string or an array of strings"));
+        assert_eq!(fs::read_to_string(&settings_path)?, original);
+        Ok(())
+    }
+}
+
+fn add_vscode_linked_project(contest_id: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let vscode_dir = cwd.join(".vscode");
     let settings_path = vscode_dir.join("settings.json");
@@ -692,62 +935,62 @@ fn add_vscode_linked_project(contest_id: &str) -> Result<()> {
     // Ensure .vscode exists
     fs::create_dir_all(&vscode_dir)?;
 
-    let new_entry = format!("./{}/Cargo.toml", contest_id);
+    update_vscode_linked_project_settings(&settings_path, contest_id)
+}
 
-    // Try to read existing settings.json
-    let mut value: Value = if settings_path.exists() {
-        let txt = fs::read_to_string(&settings_path)?;
-        match serde_json::from_str(&txt) {
-            Ok(v) => v,
-            Err(_) => {
-                // if parsing fails, start fresh
-                Value::Object(serde_json::Map::new())
-            }
+fn update_vscode_linked_project_settings(settings_path: &Path, contest_id: &str) -> Result<()> {
+    use serde_json::{Map, Value};
+
+    let new_entry = format!("./{}/Cargo.toml", contest_id);
+    let mut value = if settings_path.exists() {
+        let text = fs::read_to_string(settings_path)
+            .with_context(|| format!("failed to read {}", settings_path.display()))?;
+        match jsonc_parser::parse_to_serde_value(&text, &Default::default())
+            .with_context(|| format!("failed to parse {} as JSONC", settings_path.display()))?
+        {
+            Some(value) => value,
+            None => Value::Object(Map::new()),
         }
     } else {
-        Value::Object(serde_json::Map::new())
+        Value::Object(Map::new())
     };
 
-    // Ensure it's an object
-    if !value.is_object() {
-        value = Value::Object(serde_json::Map::new());
-    }
+    let root = value
+        .as_object_mut()
+        .with_context(|| format!("{} must contain a JSON object", settings_path.display()))?;
 
-    // Get or create the linkedProjects array
     let key = "rust-analyzer.linkedProjects";
-    let arr = match value.get_mut(key) {
-        Some(v) if v.is_array() => v.as_array_mut().unwrap(),
-        Some(v) if v.is_string() => {
-            // single string -> convert to array
-            let existing = v.as_str().unwrap().to_string();
-            *v = json!([existing]);
-            v.as_array_mut().unwrap()
-        }
-        Some(_) => {
-            // unexpected type, replace
-            value[key] = json!([new_entry]);
-            // Done, write file
-            let out = serde_json::to_string_pretty(&value)?;
-            fs::write(&settings_path, out)?;
-            return Ok(());
-        }
-        None => {
-            value[key] = json!([new_entry]);
-            let out = serde_json::to_string_pretty(&value)?;
-            fs::write(&settings_path, out)?;
-            return Ok(());
-        }
+    let existing = root.remove(key);
+    let mut linked_projects = match existing {
+        None => Vec::new(),
+        Some(Value::String(path)) => vec![path],
+        Some(Value::Array(values)) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(path) => Ok(path),
+                _ => anyhow::bail!("`{}` in {} must be an array of strings", key, settings_path.display()),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => anyhow::bail!(
+            "`{}` in {} must be a string or an array of strings",
+            key,
+            settings_path.display()
+        ),
     };
 
-    // Check presence
-    let exists = arr
-        .iter()
-        .any(|v| v.as_str().map(|s| s == new_entry).unwrap_or(false));
-    if !exists {
-        arr.push(Value::String(new_entry));
-        let out = serde_json::to_string_pretty(&value)?;
-        fs::write(&settings_path, out)?;
-    }
+    linked_projects.push(new_entry);
+    linked_projects.sort();
+    linked_projects.dedup();
+
+    root.insert(
+        key.to_string(),
+        Value::Array(linked_projects.into_iter().map(Value::String).collect()),
+    );
+
+    let formatted = serde_json::to_string_pretty(&value)
+        .with_context(|| format!("failed to format {}", settings_path.display()))?;
+    fs::write(settings_path, format!("{}\n", formatted))
+        .with_context(|| format!("failed to write {}", settings_path.display()))?;
     Ok(())
 }
 
