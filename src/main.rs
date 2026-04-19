@@ -412,10 +412,13 @@ fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> 
     if cargo_toml.exists() {
         append_bins(&cargo_toml, &root, &contest_id)?;
     }
-    // Add the contest Cargo.toml to workspace VSCode linkedProjects for rust-analyzer
-    if let Err(e) = add_vscode_linked_project(&contest_id) {
-        eprintln!("warning: failed to update .vscode/settings.json: {}", e);
+
+    if lang == "rust" {
+        if let Err(e) = add_vscode_linked_project(&contest_id) {
+            eprintln!("warning: failed to update .vscode/settings.json: {}", e);
+        }
     }
+
     if open_flag {
         let url = format!("https://atcoder.jp/contests/{}", contest_id);
         open_in_browser(&url)?;
