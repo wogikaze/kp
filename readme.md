@@ -91,6 +91,30 @@ kp.exe run abc300 a
 
 このコマンドは `abc300` ディレクトリ内で `cargo run --bin a --release` を実行します。`--debug` を付けた場合は `--release` を付けません。
 
+### 問題ファイルの追加
+
+既存コンテストに対して、新しい問題ファイルをテンプレートから追加できます。
+
+```bash
+kp.exe add abc452 a --lang rust
+```
+
+このコマンドは `abc452/src/a.rs` を作成します。Rust の場合、`Cargo.toml` の `[[bin]]` も必要に応じて追加します。
+
+`--lang` は `-l` でも指定できます。
+
+言語を省略した場合は `default_language` が使われます。
+
+```bash
+kp.exe add abc452 g
+```
+
+既存ファイルを上書きする場合は `--force` を使います。
+
+```bash
+kp.exe add abc452 a --lang cpp --force
+```
+
 ### ログイン状態の復旧
 
 以下のコマンドで、AtCoder の `REVEL_SESSION` を `acc` / `oj` に保存できます。  

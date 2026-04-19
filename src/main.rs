@@ -57,8 +57,20 @@ enum Commands {
         #[arg(long)]
         open: bool,
         /// language key (e.g. rust, cpp). If omitted, use default_language from config
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         lang: Option<String>,
+    },
+    /// 既存コンテストに問題ファイルを追加
+    Add {
+        /// contest id (optional). If omitted, current dir is used.
+        #[arg(num_args = 1..=2)]
+        params: Vec<String>,
+        /// language key (e.g. rust, cpp). If omitted, use default_language from config
+        #[arg(short = 'l', long)]
+        lang: Option<String>,
+        /// overwrite existing source file
+        #[arg(long)]
+        force: bool,
     },
     /// テスト実行
     Test {
@@ -66,7 +78,7 @@ enum Commands {
         #[arg(num_args = 1..=2)]
         params: Vec<String>,
         /// language key (e.g. rust, cpp). If omitted, use default_language from config
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         lang: Option<String>,
     },
     /// cargo run を実行
@@ -84,7 +96,7 @@ enum Commands {
         contest_id: Option<String>,
         problem_id: String,
         /// language key (e.g. rust, cpp). If omitted, use default_language from config
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         lang: Option<String>,
     },
     /// 問題ページを開く
@@ -180,6 +192,15 @@ fn main() -> Result<()> {
             open,
             lang,
         } => cmd_new(&contest_id, open, lang.as_deref())?,
+        Commands::Add {
+            params,
+            lang,
+            force,
+        } => match params.as_slice() {
+            [pid] => cmd_add(None, pid, lang.as_deref(), force)?,
+            [cid, pid] => cmd_add(Some(cid), pid, lang.as_deref(), force)?,
+            _ => anyhow::bail!("Usage: kp add [contest_id] <problem_id> [--lang <lang>] [--force]"),
+        },
         Commands::Test { params, lang } => match params.as_slice() {
             [pid] => cmd_test(None, pid, lang.as_deref())?,
             [cid, pid] => cmd_test(Some(cid), pid, lang.as_deref())?,
@@ -389,21 +410,7 @@ fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> 
     let acc_conf = acc_config_dir()?;
     let cfg = load_config(&acc_conf)?;
     let lang = select_language(&cfg, lang)?;
-    let lang_cfg = get_language_config(&cfg, &lang)?;
-    let tpl_repo = lang_cfg
-        .template_repository_url
-        .as_deref()
-        .unwrap_or(&cfg.template_repository_url);
-    let tpl_dir_name = lang_cfg
-        .template_dir
-        .clone()
-        .unwrap_or_else(|| format!("kp-{}", lang));
-    let tpl_dir = acc_conf.join(&tpl_dir_name);
-    if tpl_dir.exists() {
-        run_in("git", &["pull"], &tpl_dir)?;
-    } else {
-        run_in("git", &["clone", tpl_repo, &tpl_dir_name], &acc_conf)?;
-    }
+    let tpl_dir_name = prepare_template_dir(&cfg, &acc_conf, &lang)?;
     run("acc", &["config", "default-template", &tpl_dir_name])?;
 
     run("acc", &["new", &contest_id])?;
@@ -423,6 +430,69 @@ fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> 
         let url = format!("https://atcoder.jp/contests/{}", contest_id);
         open_in_browser(&url)?;
     }
+    Ok(())
+}
+
+fn cmd_add(
+    contest_id: Option<&str>,
+    problem_id: &str,
+    lang: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let dir = contest_dir(contest_id)?;
+    let acc_conf = acc_config_dir()?;
+    let cfg = load_config(&acc_conf)?;
+    let lang = select_language(&cfg, lang)?;
+    let tpl_dir = prepare_template_path(&cfg, &acc_conf, &lang)?;
+
+    let ext = language_extension(&lang)
+        .ok_or_else(|| anyhow::anyhow!("unsupported language: {}", lang))?;
+    let template_entry = language_template_entry(&lang)
+        .ok_or_else(|| anyhow::anyhow!("unsupported language: {}", lang))?;
+    let to = dir.join("src").join(format!("{problem_id}.{ext}"));
+    let source_exists = to.exists();
+
+    if lang == "rust" {
+        let cargo_toml = dir.join("Cargo.toml");
+        if !cargo_toml.exists() {
+            let contest_name = contest_id
+                .map(str::to_string)
+                .or_else(|| {
+                    dir.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(ToOwned::to_owned)
+                })
+                .context("failed to determine contest directory name")?;
+            bootstrap_rust_project_from_template(&tpl_dir, &dir, &contest_name)?;
+        }
+        append_bin_entry(&cargo_toml, problem_id)?;
+        if let Some(cid) = contest_id {
+            if let Err(e) = add_vscode_linked_project(cid) {
+                eprintln!("warning: failed to update .vscode/settings.json: {}", e);
+            }
+        }
+    }
+
+    if source_exists {
+        if force {
+            copy_template_source(&tpl_dir, template_entry, &to, true)?;
+        } else if lang == "rust" {
+            println!(
+                "✅ Synced Rust project metadata and kept existing {}",
+                to.display()
+            );
+            return Ok(());
+        } else {
+            anyhow::bail!(
+                "source file already exists: {} (use --force to overwrite)",
+                to.display()
+            );
+        }
+    } else {
+        copy_template_source(&tpl_dir, template_entry, &to, false)?;
+    }
+
+    println!("✅ Added {}", to.display());
     Ok(())
 }
 
@@ -450,7 +520,13 @@ fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> R
         .unwrap_or(std::env::current_dir()?);
     let test_dir = format!("tests/{problem_id}");
     let cfg = load_config(&acc_config_dir()?)?;
-    let lang = select_language(&cfg, lang)?;
+
+    let lang = match lang {
+        Some(lang) => select_language(&cfg, Some(lang))?,
+        None => detect_language_from_source(&dir, problem_id, &cfg)?
+            .unwrap_or_else(|| cfg.default_language.clone()),
+    };
+
     let lang_cfg = get_language_config(&cfg, &lang)?;
 
     if let Some(build_tpl) = lang_cfg.build_command.as_deref() {
@@ -568,6 +644,132 @@ fn cargo_run_args(bin: &str, debug: bool) -> Vec<String> {
         args.push("--release".to_string());
     }
     args
+}
+
+fn contest_dir(contest_id: Option<&str>) -> Result<PathBuf> {
+    let dir = contest_id
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    if !dir.exists() {
+        anyhow::bail!("contest directory not found: {}", dir.display());
+    }
+    if !dir.is_dir() {
+        anyhow::bail!("contest directory is not a directory: {}", dir.display());
+    }
+    Ok(dir)
+}
+
+fn prepare_template_dir(cfg: &KpConfig, acc_conf: &Path, lang: &str) -> Result<String> {
+    let lang_cfg = get_language_config(cfg, lang)?;
+    let tpl_repo = lang_cfg
+        .template_repository_url
+        .as_deref()
+        .unwrap_or(&cfg.template_repository_url);
+    let tpl_dir_name = lang_cfg
+        .template_dir
+        .clone()
+        .unwrap_or_else(|| format!("kp-{}", lang));
+    let tpl_dir = acc_conf.join(&tpl_dir_name);
+    if tpl_dir.exists() {
+        run_in("git", &["pull"], &tpl_dir)?;
+    } else {
+        run_in("git", &["clone", tpl_repo, &tpl_dir_name], &acc_conf)?;
+    }
+    Ok(tpl_dir_name)
+}
+
+fn prepare_template_path(cfg: &KpConfig, acc_conf: &Path, lang: &str) -> Result<PathBuf> {
+    let tpl_dir_name = prepare_template_dir(cfg, acc_conf, lang)?;
+    Ok(acc_conf.join(tpl_dir_name))
+}
+
+fn language_extension(lang: &str) -> Option<&'static str> {
+    match lang {
+        "rust" => Some("rs"),
+        "cpp" => Some("cpp"),
+        _ => None,
+    }
+}
+
+fn language_template_entry(lang: &str) -> Option<&'static str> {
+    match lang {
+        "rust" => Some("main.rs"),
+        "cpp" => Some("main.cpp"),
+        _ => None,
+    }
+}
+
+fn copy_template_source(
+    template_dir: &Path,
+    template_entry: &str,
+    output_path: &Path,
+    force: bool,
+) -> Result<()> {
+    let from = template_dir.join(template_entry);
+    if !from.exists() {
+        anyhow::bail!("template entry not found: {}", from.display());
+    }
+    if output_path.exists() && !force {
+        anyhow::bail!(
+            "source file already exists: {} (use --force to overwrite)",
+            output_path.display()
+        );
+    }
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::copy(&from, output_path).with_context(|| {
+        format!(
+            "failed to copy {} -> {}",
+            from.display(),
+            output_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn bootstrap_rust_project_from_template(
+    template_dir: &Path,
+    contest_dir: &Path,
+    contest_name: &str,
+) -> Result<()> {
+    fs::create_dir_all(contest_dir)
+        .with_context(|| format!("failed to create {}", contest_dir.display()))?;
+
+    for entry in fs::read_dir(template_dir)
+        .with_context(|| format!("failed to read {}", template_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if matches!(file_name, "main.rs" | "template.json") {
+            continue;
+        }
+
+        let target = contest_dir.join(file_name);
+        if !target.exists() {
+            fs::copy(&path, &target).with_context(|| {
+                format!("failed to copy {} -> {}", path.display(), target.display())
+            })?;
+        }
+    }
+
+    let cargo_toml = contest_dir.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        anyhow::bail!(
+            "template did not provide Cargo.toml: {}",
+            template_dir.display()
+        );
+    }
+    set_cargo_package_name(&cargo_toml, contest_name)?;
+    Ok(())
 }
 
 fn normalize_contest_id_input(input: &str) -> Result<String> {
@@ -1091,6 +1293,67 @@ fn append_bins(cargo_toml: &Path, contest_dir: &Path, contest_id: &str) -> Resul
     Ok(())
 }
 
+fn append_bin_entry(cargo_toml: &Path, problem_id: &str) -> Result<()> {
+    let text = fs::read_to_string(cargo_toml)
+        .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .with_context(|| format!("failed to parse {}", cargo_toml.display()))?;
+
+    let exists = match doc.get("bin") {
+        Some(item) => item
+            .as_array_of_tables()
+            .context("`bin` must be an array of tables when present")?
+            .iter()
+            .any(|bin| bin.get("name").and_then(|v| v.as_str()) == Some(problem_id)),
+        None => false,
+    };
+
+    if exists {
+        return Ok(());
+    }
+
+    let mut bins = match doc.remove("bin") {
+        Some(Item::ArrayOfTables(arr)) => arr,
+        Some(_) => anyhow::bail!("`bin` must be an array of tables when present"),
+        None => ArrayOfTables::new(),
+    };
+
+    let mut bin = Table::new();
+    bin["name"] = value(problem_id);
+    bin["path"] = value(format!("src/{}.rs", problem_id));
+    bins.push(bin);
+    doc["bin"] = Item::ArrayOfTables(bins);
+
+    fs::write(cargo_toml, doc.to_string())
+        .with_context(|| format!("failed to write {}", cargo_toml.display()))?;
+    Ok(())
+}
+
+fn set_cargo_package_name(cargo_toml: &Path, package_name: &str) -> Result<()> {
+    let text = fs::read_to_string(cargo_toml)
+        .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .with_context(|| format!("failed to parse {}", cargo_toml.display()))?;
+
+    match doc.get_mut("package") {
+        Some(item) => {
+            let package = item.as_table_mut().context("`package` must be a table")?;
+            package["name"] = value(package_name);
+        }
+        None => {
+            let mut package = Table::new();
+            package["name"] = value(package_name);
+            doc["package"] = Item::Table(package);
+        }
+    }
+
+    fs::write(cargo_toml, doc.to_string())
+        .with_context(|| format!("failed to write {}", cargo_toml.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1280,6 +1543,55 @@ path = "src/existing.rs"
     }
 
     #[test]
+    fn cli_add_parses_problem_only() -> Result<()> {
+        let cli = Cli::try_parse_from(["kp", "add", "a"])?;
+        match cli.command {
+            Commands::Add {
+                params,
+                lang,
+                force,
+            } => {
+                assert_eq!(params, vec!["a"]);
+                assert_eq!(lang, None);
+                assert!(!force);
+            }
+            other => anyhow::bail!("unexpected command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cli_add_parses_contest_problem_and_lang() -> Result<()> {
+        let cli = Cli::try_parse_from(["kp", "add", "abc452", "a", "--lang", "rust"])?;
+        match cli.command {
+            Commands::Add {
+                params,
+                lang,
+                force,
+            } => {
+                assert_eq!(params, vec!["abc452", "a"]);
+                assert_eq!(lang.as_deref(), Some("rust"));
+                assert!(!force);
+            }
+            other => anyhow::bail!("unexpected command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cli_test_parses_short_lang_flag() -> Result<()> {
+        let cli = Cli::try_parse_from(["kp", "test", "a", "-l", "cpp"])?;
+        match cli.command {
+            Commands::Test { params, lang } => {
+                assert_eq!(params, vec!["a"]);
+                assert_eq!(lang.as_deref(), Some("cpp"));
+            }
+            other => anyhow::bail!("unexpected command: {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn cli_login_parses_options() -> Result<()> {
         let cli = Cli::try_parse_from([
             "kp",
@@ -1429,6 +1741,168 @@ path = "src/existing.rs"
     }
 
     #[test]
+    fn append_bin_entry_adds_new_bin() -> Result<()> {
+        let dir = TestDir::new("append-bin-entry-adds")?;
+        let cargo_toml = dir.path().join("Cargo.toml");
+        fs::write(
+            &cargo_toml,
+            r#"[package]
+name = "abc452"
+edition = "2021"
+"#,
+        )?;
+
+        append_bin_entry(&cargo_toml, "a")?;
+
+        let text = fs::read_to_string(&cargo_toml)?;
+        let doc: DocumentMut = text.parse()?;
+        let bins = doc["bin"].as_array_of_tables().unwrap();
+        assert_eq!(bins.len(), 1);
+        let first = bins.iter().next().unwrap();
+        assert_eq!(first["name"].as_str(), Some("a"));
+        assert_eq!(first["path"].as_str(), Some("src/a.rs"));
+        Ok(())
+    }
+
+    #[test]
+    fn append_bin_entry_keeps_existing_bin() -> Result<()> {
+        let dir = TestDir::new("append-bin-entry-keeps-existing")?;
+        let cargo_toml = dir.path().join("Cargo.toml");
+        fs::write(
+            &cargo_toml,
+            r#"[package]
+name = "abc452"
+edition = "2021"
+
+[[bin]]
+name = "b"
+path = "src/b.rs"
+"#,
+        )?;
+
+        append_bin_entry(&cargo_toml, "a")?;
+
+        let text = fs::read_to_string(&cargo_toml)?;
+        let doc: DocumentMut = text.parse()?;
+        let bins = doc["bin"].as_array_of_tables().unwrap();
+        assert_eq!(bins.len(), 2);
+        assert_eq!(bins.iter().next().unwrap()["name"].as_str(), Some("b"));
+        assert_eq!(bins.iter().nth(1).unwrap()["name"].as_str(), Some("a"));
+        Ok(())
+    }
+
+    #[test]
+    fn append_bin_entry_no_duplicate() -> Result<()> {
+        let dir = TestDir::new("append-bin-entry-no-duplicate")?;
+        let cargo_toml = dir.path().join("Cargo.toml");
+        fs::write(
+            &cargo_toml,
+            r#"[package]
+name = "abc452"
+edition = "2021"
+
+[[bin]]
+name = "a"
+path = "src/a.rs"
+"#,
+        )?;
+
+        append_bin_entry(&cargo_toml, "a")?;
+
+        let text = fs::read_to_string(&cargo_toml)?;
+        let doc: DocumentMut = text.parse()?;
+        let bins = doc["bin"].as_array_of_tables().unwrap();
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins.iter().next().unwrap()["name"].as_str(), Some("a"));
+        Ok(())
+    }
+
+    #[test]
+    fn copy_template_source_creates_output_file() -> Result<()> {
+        let dir = TestDir::new("copy-template-source")?;
+        let template_dir = dir.path().join("kp-rust");
+        let output_path = dir.path().join("abc452").join("src").join("a.rs");
+        fs::create_dir_all(&template_dir)?;
+        fs::write(template_dir.join("main.rs"), "fn main() {}\n")?;
+
+        copy_template_source(&template_dir, "main.rs", &output_path, false)?;
+
+        assert_eq!(fs::read_to_string(&output_path)?, "fn main() {}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn copy_template_source_rejects_existing_file_without_force() -> Result<()> {
+        let dir = TestDir::new("copy-template-source-no-force")?;
+        let template_dir = dir.path().join("kp-rust");
+        let output_path = dir.path().join("abc452").join("src").join("a.rs");
+        fs::create_dir_all(&template_dir)?;
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(template_dir.join("main.rs"), "fn main() {}\n")?;
+        fs::write(&output_path, "old\n")?;
+
+        let err = copy_template_source(&template_dir, "main.rs", &output_path, false)
+            .expect_err("existing file should fail without force");
+        assert!(err.to_string().contains("source file already exists"));
+        assert_eq!(fs::read_to_string(&output_path)?, "old\n");
+        Ok(())
+    }
+
+    #[test]
+    fn set_cargo_package_name_updates_existing_package() -> Result<()> {
+        let dir = TestDir::new("set-cargo-package-name")?;
+        let cargo_toml = dir.path().join("Cargo.toml");
+        fs::write(
+            &cargo_toml,
+            r#"[package]
+name = "template"
+edition = "2021"
+"#,
+        )?;
+
+        set_cargo_package_name(&cargo_toml, "abc452")?;
+
+        let text = fs::read_to_string(&cargo_toml)?;
+        let doc: DocumentMut = text.parse()?;
+        assert_eq!(doc["package"]["name"].as_str(), Some("abc452"));
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_rust_project_from_template_copies_static_files() -> Result<()> {
+        let dir = TestDir::new("bootstrap-rust-project")?;
+        let template_dir = dir.path().join("kp-rust");
+        let contest_dir = dir.path().join("abc452");
+        fs::create_dir_all(&template_dir)?;
+        fs::write(
+            template_dir.join("Cargo.toml"),
+            r#"[package]
+name = "template"
+edition = "2021"
+"#,
+        )?;
+        fs::write(template_dir.join("Cargo.lock"), "lock\n")?;
+        fs::write(template_dir.join(".gitignore"), "target\n")?;
+        fs::write(template_dir.join("main.rs"), "fn main() {}\n")?;
+        fs::write(template_dir.join("template.json"), "{}\n")?;
+
+        bootstrap_rust_project_from_template(&template_dir, &contest_dir, "abc452")?;
+
+        assert!(contest_dir.join("Cargo.toml").exists());
+        assert!(contest_dir.join("Cargo.lock").exists());
+        assert!(contest_dir.join(".gitignore").exists());
+        assert!(!contest_dir.join("main.rs").exists());
+        assert!(!contest_dir.join("template.json").exists());
+
+        let text = fs::read_to_string(contest_dir.join("Cargo.toml"))?;
+        let doc: DocumentMut = text.parse()?;
+        assert_eq!(doc["package"]["name"].as_str(), Some("abc452"));
+        Ok(())
+    }
+
+    #[test]
     fn update_vscode_settings_rejects_invalid_linked_projects_type() -> Result<()> {
         let dir = TestDir::new("vscode-settings-invalid-linked-projects")?;
         let settings_path = dir.path().join("settings.json");
@@ -1540,4 +2014,34 @@ fn open_in_browser(url: &str) -> Result<()> {
             .spawn()?;
     }
     Ok(())
+}
+
+fn detect_language_from_source(
+    dir: &Path,
+    problem_id: &str,
+    cfg: &KpConfig,
+) -> Result<Option<String>> {
+    let src_dir = dir.join("src");
+    if !src_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut detected = Vec::new();
+
+    for lang in cfg.language.keys() {
+        let ext = match lang.as_str() {
+            "rust" => "rs",
+            "cpp" => "cpp",
+            _ => continue,
+        };
+        if src_dir.join(format!("{problem_id}.{ext}")).exists() {
+            detected.push(lang.clone());
+        }
+    }
+
+    if detected.len() == 1 {
+        Ok(detected.into_iter().next())
+    } else {
+        Ok(None)
+    }
 }
