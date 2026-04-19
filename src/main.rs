@@ -123,13 +123,11 @@ fn default_language() -> String {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct LanguageConfig {
-    /// repository URL for template
     template_repository_url: Option<String>,
-    /// local template dir name (default: "kp-<lang>")
     template_dir: Option<String>,
-    /// command template for test/submit (supports {problem_id} and {contest_id})
     test_command: Option<String>,
     submit_command: Option<String>,
+    build_command: Option<String>,
 }
 
 impl Default for KpConfig {
@@ -142,6 +140,7 @@ impl Default for KpConfig {
                 template_dir: Some("kp-rust".to_string()),
                 test_command: Some("cargo run --bin {problem_id} --release".to_string()),
                 submit_command: Some("cargo run --bin {problem_id} --release".to_string()),
+                build_command: None,
             },
         );
         Self {
@@ -424,6 +423,24 @@ fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> 
     Ok(())
 }
 
+fn run_shell_in(command: &str, dir: &Path) -> Result<()> {
+    let status = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .current_dir(dir)
+            .args(["/C", command])
+            .status()?
+    } else {
+        Command::new("sh")
+            .current_dir(dir)
+            .args(["-c", command])
+            .status()?
+    };
+    if !status.success() {
+        anyhow::bail!("Command failed in {:?}: {}", dir, command);
+    }
+    Ok(())
+}
+
 fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> Result<()> {
     let dir = contest_id
         .map(PathBuf::from)
@@ -432,28 +449,33 @@ fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> R
     let cfg = load_config(&acc_config_dir()?)?;
     let lang = select_language(&cfg, lang)?;
     let lang_cfg = get_language_config(&cfg, &lang)?;
-    let cmd_tpl = lang_cfg
+
+    if let Some(build_tpl) = lang_cfg.build_command.as_deref() {
+        let build_cmd = apply_command_template(build_tpl, contest_id, problem_id);
+        run_shell_in(&build_cmd, &dir)?;
+    }
+
+    let run_tpl = lang_cfg
         .test_command
         .as_deref()
         .unwrap_or("cargo run --bin {problem_id} --release");
-    let cmd = apply_command_template(cmd_tpl, contest_id, problem_id);
-    // On Windows, ask oj to run `cmd /C <command>` so it executes via cmd
+    let run_cmd = apply_command_template(run_tpl, contest_id, problem_id);
+
     let args_owned: Vec<String> = if cfg!(target_os = "windows") {
-        let wrapped = format!("cmd /C {}", cmd);
         vec![
             "test".to_string(),
             "-c".to_string(),
-            wrapped,
+            format!("cmd /C {}", run_cmd),
             "-d".to_string(),
-            test_dir.clone(),
+            test_dir,
         ]
     } else {
         vec![
             "test".to_string(),
             "-c".to_string(),
-            cmd.clone(),
+            run_cmd,
             "-d".to_string(),
-            test_dir.clone(),
+            test_dir,
         ]
     };
     let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
@@ -986,6 +1008,7 @@ fn load_config(acc_conf: &Path) -> Result<KpConfig> {
                 template_dir: Some("kp-rust".to_string()),
                 test_command: Some("cargo run --bin {problem_id} --release".to_string()),
                 submit_command: Some("cargo run --bin {problem_id} --release".to_string()),
+                build_command: None,
             },
         );
     }
