@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 /// ==============================
@@ -259,15 +263,15 @@ fn cmd_init(repository: Option<&str>) -> Result<()> {
         .unwrap_or_else(|| format!("kp-{}", lang));
     let tpl_dir = acc_conf.join(&tpl_dir_name);
     if tpl_dir.exists() {
-        run_in("git", &["pull"], &tpl_dir)?;
+        run_in_timeout("git", &["pull"], &tpl_dir, Duration::from_secs(30))?;
     } else {
-        run_in("git", &["clone", tpl_repo, &tpl_dir_name], &acc_conf)?;
+        run_in_timeout("git", &["clone", tpl_repo, &tpl_dir_name], &acc_conf, Duration::from_secs(60))?;
     }
 
     // acc 設定
-    run("acc", &["config", "default-template", &tpl_dir_name])?;
-    run("acc", &["config", "default-task-dirname-format", "./"])?;
-    run("acc", &["config", "default-task-choice", "all"])?;
+    run_timeout("acc", &["config", "default-template", &tpl_dir_name], Duration::from_secs(10))?;
+    run_timeout("acc", &["config", "default-task-dirname-format", "./"], Duration::from_secs(10))?;
+    run_timeout("acc", &["config", "default-task-choice", "all"], Duration::from_secs(10))?;
     println!("✅ Initialized successfully");
     Ok(())
 }
@@ -411,20 +415,29 @@ fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> 
     let cfg = load_config(&acc_conf)?;
     let lang = select_language(&cfg, lang)?;
     let tpl_dir_name = prepare_template_dir(&cfg, &acc_conf, &lang)?;
-    run("acc", &["config", "default-template", &tpl_dir_name])?;
+    let tpl_dir = acc_conf.join(&tpl_dir_name);
 
-    run("acc", &["new", &contest_id])?;
+    let ext = language_extension(&lang).unwrap_or("rs");
     let root = PathBuf::from(&contest_id);
-    let cargo_toml = root.join("Cargo.toml");
-    if cargo_toml.exists() {
-        append_bins(&cargo_toml, &root, &contest_id)?;
-    }
 
+    // 1. Create contest project (fetch tasks, create dirs, copy templates)
+    let tasks = create_contest_project(&contest_id, &root, &tpl_dir, ext)?;
+
+    // 2. Handle Rust-specific setup
     if lang == "rust" {
+        let cargo_toml = root.join("Cargo.toml");
+        if cargo_toml.exists() {
+            append_bins(&cargo_toml, &root, &contest_id)?;
+        }
         if let Err(e) = add_vscode_linked_project(&contest_id) {
             eprintln!("warning: failed to update .vscode/settings.json: {}", e);
         }
     }
+
+    // 3. Download test cases in parallel (timeout 120s per task)
+    eprintln!("[kp] downloading test cases in parallel...");
+    let dl_timeout = Duration::from_secs(120);
+    download_tests_parallel(&contest_id, &tasks, &root, dl_timeout)?;
 
     if open_flag {
         let url = format!("https://atcoder.jp/contests/{}", contest_id);
@@ -496,22 +509,51 @@ fn cmd_add(
     Ok(())
 }
 
-fn run_shell_in(command: &str, dir: &Path) -> Result<()> {
-    let status = if cfg!(target_os = "windows") {
+fn run_shell_in_timeout(command: &str, dir: &Path, timeout: Duration) -> Result<()> {
+    let mut child = if cfg!(target_os = "windows") {
         Command::new("cmd")
             .current_dir(dir)
             .args(["/C", command])
-            .status()?
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("failed to spawn shell in {:?}", dir))?
     } else {
         Command::new("sh")
             .current_dir(dir)
             .args(["-c", command])
-            .status()?
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("failed to spawn shell in {:?}", dir))?
     };
-    if !status.success() {
-        anyhow::bail!("Command failed in {:?}: {}", dir, command);
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                anyhow::bail!("Command failed in {:?}: {}", dir, command);
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "Command timed out after {}s in {:?}: {}",
+                        timeout.as_secs(),
+                        dir,
+                        command
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                anyhow::bail!("Command error in {:?}: {}: {}", dir, command, e);
+            }
+        }
     }
-    Ok(())
 }
 
 fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> Result<()> {
@@ -531,7 +573,7 @@ fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> R
 
     if let Some(build_tpl) = lang_cfg.build_command.as_deref() {
         let build_cmd = apply_command_template(build_tpl, contest_id, problem_id);
-        run_shell_in(&build_cmd, &dir)?;
+        run_shell_in_timeout(&build_cmd, &dir, Duration::from_secs(120))?;
     }
 
     let run_tpl = lang_cfg
@@ -558,7 +600,7 @@ fn cmd_test(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) -> R
         ]
     };
     let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
-    run_in("oj", &args, &dir)?;
+    run_in_timeout("oj", &args, &dir, Duration::from_secs(120))?;
     Ok(())
 }
 
@@ -568,7 +610,7 @@ fn cmd_run(contest_id: Option<&str>, bin: &str, debug: bool) -> Result<()> {
         .unwrap_or(std::env::current_dir()?);
     let args_owned = cargo_run_args(bin, debug);
     let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
-    run_in("cargo", &args, &dir)?;
+    run_in_timeout("cargo", &args, &dir, Duration::from_secs(300))?;
     Ok(())
 }
 
@@ -607,7 +649,7 @@ fn cmd_submit(contest_id: Option<&str>, problem_id: &str, lang: Option<&str>) ->
         ]
     };
     let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
-    run_in("oj", &args, &dir)?;
+    run_in_timeout("oj", &args, &dir, Duration::from_secs(120))?;
     Ok(())
 }
 
@@ -671,9 +713,9 @@ fn prepare_template_dir(cfg: &KpConfig, acc_conf: &Path, lang: &str) -> Result<S
         .unwrap_or_else(|| format!("kp-{}", lang));
     let tpl_dir = acc_conf.join(&tpl_dir_name);
     if tpl_dir.exists() {
-        run_in("git", &["pull"], &tpl_dir)?;
+        run_in_timeout("git", &["pull"], &tpl_dir, Duration::from_secs(30))?;
     } else {
-        run_in("git", &["clone", tpl_repo, &tpl_dir_name], &acc_conf)?;
+        run_in_timeout("git", &["clone", tpl_repo, &tpl_dir_name], &acc_conf, Duration::from_secs(60))?;
     }
     Ok(tpl_dir_name)
 }
@@ -796,7 +838,219 @@ fn normalize_contest_id_input(input: &str) -> Result<String> {
     Ok(input.to_string())
 }
 
-// JSON structures for contest.acc.json (partial)
+/// ==============================
+/// AtCoder task fetching / parsing (replaces `acc new`)
+/// ==============================
+
+#[derive(Debug, Clone)]
+struct TaskInfo {
+    id: String,
+    label: String,
+    url: String,
+}
+
+/// Fetch the tasks page HTML via curl (with timeout).
+fn fetch_tasks_html(contest_id: &str) -> Result<String> {
+    let url = format!("https://atcoder.jp/contests/{}/tasks", contest_id);
+    let output = Command::new("curl")
+        .args(["-s", "--max-time", "30", &url])
+        .output()
+        .with_context(|| format!("failed to run curl to fetch {}", url))?;
+    if !output.status.success() {
+        anyhow::bail!("curl failed (exit={:?}) fetching {}", output.status.code(), url);
+    }
+    Ok(String::from_utf8(output.stdout).context("tasks page is not valid UTF-8")?)
+}
+
+/// Parse task list from the tasks page HTML.
+fn parse_tasks_from_html(contest_id: &str, html: &str) -> Result<Vec<TaskInfo>> {
+    // Pattern: href="/contests/{contest_id}/tasks/{task_id}">{label}</a>
+    let pattern = format!(
+        r#"/contests/{}/tasks/([a-zA-Z0-9_]+)"[^>]*>([^<]+)</a>"#,
+        regex::escape(contest_id)
+    );
+    let re = Regex::new(&pattern).context("failed to compile task regex")?;
+
+    let mut tasks = Vec::new();
+    let mut seen = HashSet::new();
+
+    for cap in re.captures_iter(html) {
+        let task_id = cap[1].to_string();
+        if !seen.insert(task_id.clone()) {
+            continue;
+        }
+        let label = cap[2].trim().to_string();
+        tasks.push(TaskInfo {
+            id: task_id.clone(),
+            label,
+            url: format!("https://atcoder.jp/contests/{}/tasks/{}", contest_id, task_id),
+        });
+    }
+
+    if tasks.is_empty() {
+        anyhow::bail!(
+            "no tasks found on the tasks page for contest `{}`.\n\
+             Check that the contest exists and is accessible with: curl -s https://atcoder.jp/contests/{}/tasks",
+            contest_id,
+            contest_id
+        );
+    }
+
+    Ok(tasks)
+}
+
+/// Create a contest project directory structure without calling `acc new`.
+/// Returns the list of tasks for further processing.
+fn create_contest_project(
+    contest_id: &str,
+    root: &Path,
+    template_dir: &Path,
+    ext: &str,
+) -> Result<Vec<TaskInfo>> {
+    // 1. Fetch tasks page
+    eprintln!("[kp] fetching tasks page for {} ...", contest_id);
+    let html = fetch_tasks_html(contest_id)?;
+    let tasks = parse_tasks_from_html(contest_id, &html)?;
+    eprintln!("[kp] found {} tasks", tasks.len());
+
+    // 2. Create src/ and tests/ directories
+    let src_dir = root.join("src");
+    let tests_dir = root.join("tests");
+    fs::create_dir_all(&src_dir).context("failed to create src/")?;
+    fs::create_dir_all(&tests_dir).context("failed to create tests/")?;
+
+    // 3. Write contest.acc.json (compatible with acc format)
+    let acc_json = serde_json::json!({
+        "contest": {
+            "id": contest_id,
+            "title": format!("AtCoder {}", contest_id),
+            "url": format!("https://atcoder.jp/contests/{}", contest_id),
+        },
+        "tasks": tasks.iter().map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "label": t.label,
+                "title": t.label,
+                "url": t.url,
+                "directory": {
+                    "path": "./",
+                    "testdir": format!("tests/{}", t.label.to_lowercase()),
+                    "submit": format!("src/{}.{}", t.label.to_lowercase(), ext),
+                }
+            })
+        }).collect::<Vec<_>>(),
+    });
+    let acc_path = root.join("contest.acc.json");
+    fs::write(&acc_path, serde_json::to_string_pretty(&acc_json)?)
+        .with_context(|| format!("failed to write {}", acc_path.display()))?;
+    eprintln!("[kp] created {}", acc_path.display());
+
+    // 4. Copy template source for each task
+    let template_entry = format!("main.{}", ext);
+    for task in &tasks {
+        let label_lower = task.label.to_lowercase();
+        let src_path = src_dir.join(format!("{}.{}", label_lower, ext));
+        if src_path.exists() {
+            eprintln!("[kp] skipped existing {}", src_path.display());
+            continue;
+        }
+        let from = template_dir.join(&template_entry);
+        if !from.exists() {
+            anyhow::bail!("template entry not found: {}", from.display());
+        }
+        fs::copy(&from, &src_path)
+            .with_context(|| format!("failed to copy template to {}", src_path.display()))?;
+        eprintln!("[kp] created {}", src_path.display());
+    }
+
+    Ok(tasks)
+}
+
+/// Download test cases in parallel for all tasks using `oj download`.
+fn download_tests_parallel(_contest_id: &str, tasks: &[TaskInfo], root: &Path, timeout: Duration) -> Result<()> {
+    let mut handles = Vec::new();
+    let (tx, rx) = mpsc::channel::<Result<String>>();
+
+    for task in tasks {
+        let label_lower = task.label.to_lowercase();
+        let test_dir = root.join("tests").join(&label_lower);
+        let url = task.url.clone();
+        let tx = tx.clone();
+
+        handles.push(thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let start = Instant::now();
+                let mut child = Command::new("oj")
+                    .args(["download", "-d", &test_dir.to_string_lossy(), &url])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .with_context(|| format!("failed to spawn oj download for {}", label_lower))?;
+
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            if status.success() {
+                                let elapsed = start.elapsed();
+                                eprintln!("[kp] downloaded tests for {} ({:.1}s)", label_lower, elapsed.as_secs_f64());
+                                return Ok(());
+                            }
+                            anyhow::bail!(
+                                "oj download failed for {} (exit={:?})",
+                                label_lower,
+                                status.code(),
+                            );
+                        }
+                        Ok(None) => {
+                            if start.elapsed() > timeout {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                anyhow::bail!("oj download timed out for {} (>{:?})", label_lower, timeout);
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => {
+                            anyhow::bail!("oj download error for {}: {}", label_lower, e);
+                        }
+                    }
+                }
+            })();
+            tx.send(result.map(|_| label_lower))
+                .expect("download_tests_parallel: rx dropped");
+        }));
+    }
+
+    drop(tx); // close our sender
+
+    let mut errors = Vec::new();
+    let mut success_count = 0;
+    for result in rx {
+        match result {
+            Ok(label) => {
+                success_count += 1;
+                eprintln!("[kp] ✓ {} test cases ready", label);
+            }
+            Err(e) => {
+                errors.push(e);
+            }
+        }
+    }
+
+    // Wait for all threads (they should have finished since rx ended)
+    for h in handles {
+        let _ = h.join();
+    }
+
+    if !errors.is_empty() {
+        eprintln!("[kp] ⚠ {} test download(s) failed", errors.len());
+        for e in &errors {
+            eprintln!("  └─ {}", e);
+        }
+    }
+
+    eprintln!("[kp] test download complete: {}/{} succeeded", success_count, tasks.len());
+    Ok(())
+}
 #[derive(Deserialize, Debug)]
 struct ContestFile {
     contest: ContestEntry,
@@ -1149,35 +1403,80 @@ fn format_lwp_cookie_value(value: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
-// Run a command in a platform-appropriate way. On Windows, use `cmd /C` so
-// shims like npm's `.cmd`/.ps1 are resolved the same way an interactive shell
-// would. On Unix, run directly.
-fn run(cmd: &str, args: &[&str]) -> Result<()> {
-    let status = if cfg!(target_os = "windows") {
-        let mut all = vec!["/C", cmd];
-        all.extend(args.iter().map(|s| *s));
-        Command::new("cmd").args(all).status()?
-    } else {
-        Command::new(cmd).args(args).status()?
-    };
-    if !status.success() {
-        anyhow::bail!("Command failed: {} {:?}", cmd, args);
+/// Run a command with a timeout. Kills the process if it exceeds the timeout.
+fn run_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<()> {
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to spawn: {} {:?}", cmd, args))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                anyhow::bail!("Command failed: {} {:?}", cmd, args);
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "Command timed out after {}s: {} {:?}",
+                        timeout.as_secs(),
+                        cmd,
+                        args
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                anyhow::bail!("Command error: {} {:?}: {}", cmd, args, e);
+            }
+        }
     }
-    Ok(())
 }
 
-fn run_in(cmd: &str, args: &[&str], dir: &Path) -> Result<()> {
-    let status = if cfg!(target_os = "windows") {
-        let mut all = vec!["/C", cmd];
-        all.extend(args.iter().map(|s| *s));
-        Command::new("cmd").current_dir(dir).args(all).status()?
-    } else {
-        Command::new(cmd).current_dir(dir).args(args).status()?
-    };
-    if !status.success() {
-        anyhow::bail!("Command failed in {:?}: {} {:?}", dir, cmd, args);
+/// Run a command with a timeout in a specific directory.
+fn run_in_timeout(cmd: &str, args: &[&str], dir: &Path, timeout: Duration) -> Result<()> {
+    let mut child = Command::new(cmd)
+        .current_dir(dir)
+        .args(args)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to spawn: {} {:?} in {:?}", cmd, args, dir))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                anyhow::bail!("Command failed in {:?}: {} {:?}", dir, cmd, args);
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "Command timed out after {}s in {:?}: {} {:?}",
+                        timeout.as_secs(),
+                        dir,
+                        cmd,
+                        args
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                anyhow::bail!("Command error in {:?}: {} {:?}: {}", dir, cmd, args, e);
+            }
+        }
     }
-    Ok(())
 }
 
 fn acc_config_dir() -> Result<PathBuf> {
