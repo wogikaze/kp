@@ -425,7 +425,7 @@ fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> 
 
     // 2. Handle Rust-specific setup
     if lang == "rust" {
-``        // Copy Cargo.toml, Cargo.lock, .gitignore etc. from template
+        // Copy Cargo.toml, Cargo.lock, .gitignore etc. from template
         bootstrap_rust_project_from_template(&tpl_dir, &root, &contest_id)?;
         let cargo_toml = root.join("Cargo.toml");
         if cargo_toml.exists() {
