@@ -425,6 +425,8 @@ fn cmd_new(contest_id: &str, open_flag: bool, lang: Option<&str>) -> Result<()> 
 
     // 2. Handle Rust-specific setup
     if lang == "rust" {
+``        // Copy Cargo.toml, Cargo.lock, .gitignore etc. from template
+        bootstrap_rust_project_from_template(&tpl_dir, &root, &contest_id)?;
         let cargo_toml = root.join("Cargo.toml");
         if cargo_toml.exists() {
             append_bins(&cargo_toml, &root, &contest_id)?;
@@ -978,42 +980,95 @@ fn download_tests_parallel(_contest_id: &str, tasks: &[TaskInfo], root: &Path, t
         let tx = tx.clone();
 
         handles.push(thread::spawn(move || {
+            let max_retries = 2;
             let result = (|| -> Result<()> {
-                let start = Instant::now();
-                let mut child = Command::new("oj")
-                    .args(["download", "-d", &test_dir.to_string_lossy(), &url])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .with_context(|| format!("failed to spawn oj download for {}", label_lower))?;
-
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            if status.success() {
-                                let elapsed = start.elapsed();
-                                eprintln!("[kp] downloaded tests for {} ({:.1}s)", label_lower, elapsed.as_secs_f64());
-                                return Ok(());
-                            }
-                            anyhow::bail!(
-                                "oj download failed for {} (exit={:?})",
-                                label_lower,
-                                status.code(),
-                            );
-                        }
-                        Ok(None) => {
-                            if start.elapsed() > timeout {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                anyhow::bail!("oj download timed out for {} (>{:?})", label_lower, timeout);
-                            }
-                            thread::sleep(Duration::from_millis(10));
-                        }
+                let overall_start = Instant::now();
+                for attempt in 1..=max_retries {
+                    let start = Instant::now();
+                    let mut child = match Command::new("oj")
+                        .args(["download", "-d", &test_dir.to_string_lossy(), &url])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        Ok(child) => child,
                         Err(e) => {
-                            anyhow::bail!("oj download error for {}: {}", label_lower, e);
+                            if attempt < max_retries {
+                                eprintln!(
+                                    "[kp] retry {}/{} for {} (spawn failed: {})",
+                                    attempt, max_retries, label_lower, e
+                                );
+                                thread::sleep(Duration::from_secs(1));
+                                continue;
+                            }
+                            anyhow::bail!("failed to spawn oj download for {}: {}", label_lower, e);
+                        }
+                    };
+
+                    let mut success = false;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                if status.success() {
+                                    let elapsed = start.elapsed();
+                                    eprintln!("[kp] downloaded tests for {} ({:.1}s)", label_lower, elapsed.as_secs_f64());
+                                    success = true;
+                                    break;
+                                }
+                                // oj download failed
+                                let _ = child.wait();
+                                if attempt < max_retries {
+                                    eprintln!(
+                                        "[kp] retry {}/{} for {} (exit={:?})",
+                                        attempt, max_retries, label_lower, status.code()
+                                    );
+                                    thread::sleep(Duration::from_secs(1));
+                                    break;
+                                }
+                                anyhow::bail!(
+                                    "oj download failed for {} (exit={:?})",
+                                    label_lower,
+                                    status.code(),
+                                );
+                            }
+                            Ok(None) => {
+                                if start.elapsed() > timeout {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    if attempt < max_retries {
+                                        eprintln!(
+                                            "[kp] retry {}/{} for {} (timeout)",
+                                            attempt, max_retries, label_lower
+                                        );
+                                        break;
+                                    }
+                                    anyhow::bail!("oj download timed out for {} (>{:?})", label_lower, timeout);
+                                }
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(e) => {
+                                if attempt < max_retries {
+                                    eprintln!(
+                                        "[kp] retry {}/{} for {} (error: {})",
+                                        attempt, max_retries, label_lower, e
+                                    );
+                                    thread::sleep(Duration::from_secs(1));
+                                    break;
+                                }
+                                anyhow::bail!("oj download error for {}: {}", label_lower, e);
+                            }
                         }
                     }
+                    if success {
+                        return Ok(());
+                    }
                 }
+                anyhow::bail!(
+                    "oj download failed for {} after {} retries ({:.1}s total)",
+                    label_lower,
+                    max_retries - 1,
+                    overall_start.elapsed().as_secs_f64()
+                );
             })();
             tx.send(result.map(|_| label_lower))
                 .expect("download_tests_parallel: rx dropped");
@@ -1480,20 +1535,61 @@ fn run_in_timeout(cmd: &str, args: &[&str], dir: &Path, timeout: Duration) -> Re
 }
 
 fn acc_config_dir() -> Result<PathBuf> {
-    // Use same platform-aware invocation as run/run_in so Windows shims work.
-    let out = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", "acc", "config-dir"])
-            .output()
-            .context("failed to run acc config-dir")?
-    } else {
-        Command::new("acc")
-            .arg("config-dir")
-            .output()
-            .context("failed to run acc config-dir")?
-    };
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(PathBuf::from(s))
+    static CACHE: std::sync::OnceLock<Result<PathBuf>> = std::sync::OnceLock::new();
+    let result = CACHE.get_or_init(|| {
+        // Use well-known default path to avoid spawning slow Node.js `acc` CLI.
+        let default = default_acc_config_dir();
+        if default.join(CONFIG_FILE_NAME).exists() || default.join("session.json").exists() {
+            return Ok(default);
+        }
+        // Fallback: run `acc config-dir`
+        (|| -> Result<PathBuf> {
+            let out = if cfg!(target_os = "windows") {
+                Command::new("cmd")
+                    .args(["/C", "acc", "config-dir"])
+                    .output()
+                    .context("failed to run acc config-dir")?
+            } else {
+                Command::new("acc")
+                    .arg("config-dir")
+                    .output()
+                    .context("failed to run acc config-dir")?
+            };
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Ok(PathBuf::from(s))
+        })()
+    });
+    match result {
+        Ok(path) => Ok(path.clone()),
+        Err(e) => Err(anyhow::anyhow!("{}", e)),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn default_acc_config_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Roaming"))
+        .join("atcoder-cli-nodejs")
+}
+
+#[cfg(target_os = "macos")]
+fn default_acc_config_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    home.join("Library")
+        .join("Application Support")
+        .join("atcoder-cli-nodejs")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn default_acc_config_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("atcoder-cli-nodejs")
 }
 
 fn load_config(acc_conf: &Path) -> Result<KpConfig> {
